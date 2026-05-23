@@ -276,6 +276,33 @@ interface nsICacheEntry : nsISupports
   readonly attribute long long dataSize;
 
   /**
+   * Sparse-entry queries (HTTP byte-range caching). A sparse entry may be only
+   * partially filled; offsets are relative to this entry's data.
+   *
+   * isRangeCached: true iff [offset, offset+length) is entirely present.
+   *
+   * firstAvailableRange: the first contiguous present run at or after offset.
+   * Returns true and sets start/length when some data is present at or after
+   * offset; false otherwise.
+   */
+  boolean isRangeCached(in long long offset, in long long length);
+  boolean firstAvailableRange(in long long offset, out long long start,
+                              out long long length);
+
+  /**
+   * Like openInputStream, but limits reads to [offset, readEndBound). Past the
+   * bound the stream returns clean EOF rather than probing the underlying
+   * sparse map. Used for windowed sparse reads so an adjacent hole after the
+   * window doesn't surface as NS_ERROR_CACHE_DATA_INCOMPLETE.
+   *
+   * @param offset       read starting from this offset.
+   * @param readEndBound absolute byte offset at which the stream should EOF.
+   *                     -1 means unbounded (same as openInputStream).
+   */
+  nsIInputStream openBoundedInputStream(in long long offset,
+                                        in long long readEndBound);
+
+  /**
   * Returns the length of data this entry holds.
   * @throws
   *    - NS_ERROR_IN_PROGRESS when a write is still in progress (either real

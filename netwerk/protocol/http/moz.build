@@ -180,6 +180,8 @@ UNIFIED_SOURCES += [
     "PendingTransactionQueue.cpp",
     "QuicSocketControl.cpp",
     "ReplacedHttpResponse.cpp",
+    "SparseCache.cpp",
+    "SparseMeta.cpp",
     "SpeculativeTransaction.cpp",
     "TlsHandshaker.cpp",
     "TLSTransportLayer.cpp",

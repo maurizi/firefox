@@ -422,6 +422,9 @@ with modules["NETWORK"]:
     errors["NS_ERROR_CACHE_READ_ACCESS_DENIED"] = FAILURE(66)
     errors["NS_ERROR_CACHE_WRITE_ACCESS_DENIED"] = FAILURE(67)
     errors["NS_ERROR_CACHE_IN_USE"] = FAILURE(68)
+    # A read into a sparse cache entry hit a hole, i.e. a byte range that is not
+    # present in the entry.
+    errors["NS_ERROR_CACHE_DATA_INCOMPLETE"] = FAILURE(69)
     # Error passed through onStopRequest if the document could not be fetched
     # from the cache.
     errors["NS_ERROR_DOCUMENT_NOT_CACHED"] = FAILURE(70)

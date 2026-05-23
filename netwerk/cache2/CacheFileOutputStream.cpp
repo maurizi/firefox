@@ -158,6 +158,13 @@ CacheFileOutputStream::Write(const char* aBuf, uint32_t aCount,
     memcpy(hnd.Buf() + chunkOffset, aBuf, thisWrite);
     hnd.UpdateDataSize(chunkOffset, thisWrite);
 
+    // Record the real data just written so a sparse (partially-filled) entry
+    // knows which byte ranges are present. Zero-fill (FillHole /
+    // PadChunkWithZeroes) goes straight to the chunk and is intentionally not
+    // recorded, so it stays a hole. For a normal contiguous write this builds
+    // the single range [0, size).
+    mFile->MarkRangeWrittenLocked(mPos, thisWrite);
+
     mPos += thisWrite;
     aBuf += thisWrite;
     aCount -= thisWrite;

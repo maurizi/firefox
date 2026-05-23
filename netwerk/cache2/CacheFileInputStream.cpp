@@ -551,6 +551,23 @@ void CacheFileInputStream::EnsureCorrectChunk(bool aReleaseOnly) {
   LOG(("CacheFileInputStream::EnsureCorrectChunk() [this=%p, releaseOnly=%d]",
        this, aReleaseOnly));
 
+  // Windowed sparse read past the bound: close so consumers see clean EOF.
+  // This must happen here (not just in CanRead) because CanRead is only
+  // reached when mChunk is non-null. When mPos has just crossed the bound
+  // and the next chunk fetch would return NS_ERROR_NOT_AVAILABLE (e.g. mPos
+  // == entry's mDataSize), without this close the stream stays half-open,
+  // Available returns 0/NS_OK, and async consumers (notably the multiplex
+  // serve coordinator's nsMultiplexInputStream::OnInputStreamReady, which
+  // only advances on NS_BASE_STREAM_CLOSED) spin forever re-waiting.
+  if (mReadEndBound >= 0 && mPos >= mReadEndBound && !mClosed) {
+    LOG(
+        ("CacheFileInputStream::EnsureCorrectChunk() [this=%p] hit windowed "
+         "bound; mPos=%" PRId64 " mReadEndBound=%" PRId64 " closing for EOF",
+         this, mPos, mReadEndBound));
+    CloseWithStatusLocked(NS_OK);
+    return;
+  }
+
   nsresult rv;
 
   uint32_t chunkIdx = mPos / kChunkSize;
@@ -619,11 +636,51 @@ int64_t CacheFileInputStream::CanRead(CacheFileChunkReadHandle* aHandle) {
   MOZ_ASSERT(mChunk);
   MOZ_ASSERT(mPos / kChunkSize == mChunk->Index());
 
+  // Windowed sparse read: past the bound is clean EOF for this reader.
+  // Close the stream so consumers (notably nsMultiplexInputStream's async
+  // wait path, which re-polls async sub-streams that return Available()==0
+  // and only advances on NS_BASE_STREAM_CLOSED) see closed-EOF and advance,
+  // instead of waiting forever for more data this reader can never produce.
+  if (mReadEndBound >= 0 && mPos >= mReadEndBound) {
+    LOG(
+        ("CacheFileInputStream::CanRead() [this=%p] hit windowed bound; "
+         "mPos=%" PRId64 " mReadEndBound=%" PRId64 " closing for EOF",
+         this, mPos, mReadEndBound));
+    CloseWithStatusLocked(NS_OK);
+    return 0;
+  }
+
   int64_t retval = aHandle->Offset() + aHandle->DataSize();
 
   if (!mAlternativeData && mFile->mAltDataOffset != -1 &&
       mFile->mAltDataOffset < retval) {
     retval = mFile->mAltDataOffset;
+  }
+  if (mReadEndBound >= 0 && mReadEndBound < retval) {
+    retval = mReadEndBound;
+  }
+
+  // For a sparse (partially-filled) entry, do not read across a hole. Find
+  // the next cached run at or after mPos:
+  //   - no further data    -> reads past EOF of cached data, return 0 cleanly
+  //                           (the slice consumer's own EOF; not a hole).
+  //   - run starts > mPos  -> mPos is strictly inside a hole; surface
+  //                           NS_ERROR_CACHE_DATA_INCOMPLETE so callers don't
+  //                           silently read the file-system zero-fill.
+  //   - run covers mPos    -> clamp to the run's absolute end.
+  if (!mAlternativeData && mFile->IsSparseLocked()) {
+    int64_t availStart = 0, availLen = 0;
+    if (!mFile->FirstAvailableRangeLocked(mPos, &availStart, &availLen)) {
+      return 0;
+    }
+    if (availStart > mPos) {
+      CloseWithStatusLocked(NS_ERROR_CACHE_DATA_INCOMPLETE);
+      return 0;
+    }
+    int64_t runEnd = availStart + availLen;
+    if (runEnd < retval) {
+      retval = runEnd;
+    }
   }
 
   retval -= mPos;

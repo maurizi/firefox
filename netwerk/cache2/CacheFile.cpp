@@ -646,6 +646,7 @@ nsresult CacheFile::OnMetadataRead(nsresult aResult) {
           mAltDataType.Truncate();
           mDataSize = 0;
         } else {
+          LoadSparseRangesLocked();
           PreloadChunks(0);
         }
       }
@@ -1488,6 +1489,52 @@ nsresult CacheFile::GetChunkLocked(uint32_t aIndex, ECallerType aCaller,
       return NS_ERROR_UNEXPECTED;
     }
 
+    // Sparse-cache hole: when a write to a higher chunk bumped mDataSize past
+    // this index, intermediate chunks were marked with kEmptyChunkHash to
+    // record that they have no on-disk data. Attempting to read them from
+    // disk fails with NS_ERROR_NOT_AVAILABLE on a fresh entry whose file
+    // handle hasn't been written yet, which would poison CacheFile::mStatus
+    // and silently drop every subsequent write to this entry (bug 1615698).
+    // Create a fresh chunk full of zeroes so the writer can overlay its data
+    // and so any later disk reads of this chunk return matching data. The
+    // chunk must be kChunkSize wide because mDataSize already implies it,
+    // and a partial chunk would produce a hash mismatch on the next read.
+    if (mMetadata->GetHash(aIndex) == kEmptyChunkHash) {
+      if (aCaller == PRELOADER) {
+        return NS_OK;
+      }
+
+      chunk = new CacheFileChunk(this, aIndex, aCaller == WRITER);
+      mChunks.InsertOrUpdate(aIndex, RefPtr{chunk});
+      chunk->mActiveChunk = true;
+
+      LOG(
+          ("CacheFile::GetChunkLocked() - Created new empty chunk %p for "
+           "sparse hole [this=%p]",
+           chunk.get(), this));
+
+      chunk->InitNew();
+      {
+        CacheFileChunkWriteHandle hnd = chunk->GetWriteHandle(kChunkSize);
+        if (!hnd.Buf()) {
+          RemoveChunkInternal(chunk, false);
+          SetError(NS_ERROR_OUT_OF_MEMORY);
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+        memset(hnd.Buf(), 0, kChunkSize);
+        hnd.UpdateDataSize(0, kChunkSize);
+      }
+      mMetadata->SetHash(aIndex, chunk->Hash());
+
+      if (HaveChunkListeners(aIndex)) {
+        rv = NotifyChunkListeners(aIndex, NS_OK, chunk);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
+
+      chunk.swap(*_retval);
+      return NS_OK;
+    }
+
     chunk = new CacheFileChunk(this, aIndex, aCaller == WRITER);
     mChunks.InsertOrUpdate(aIndex, RefPtr{chunk});
     chunk->mActiveChunk = true;
@@ -1565,8 +1612,15 @@ nsresult CacheFile::GetChunkLocked(uint32_t aIndex, ECallerType aCaller,
         // We don't need to create CacheFileChunk for other empty chunks unless
         // there is some input stream waiting for this chunk.
 
-        if (startChunk != aIndex) {
-          // Make sure the file contains zeroes at the end of the file
+        if (startChunk != aIndex && mHandle) {
+          // Make sure the file contains zeroes at the end of the file. Only
+          // when the on-disk file is already open (mHandle non-null): a write
+          // can reach here before the async OpenFile completes (e.g. a sparse
+          // write-through hitting a high child offset of a fresh entry); the
+          // missing chunks will then naturally appear as a file-system sparse
+          // hole when chunk aIndex is later flushed at its own offset, and
+          // sparse-aware reads gate on the range map so the unzeroed region
+          // is never read back as data.
           rv = CacheFileIOManager::TruncateSeekSetEOF(
               mHandle, startChunk * kChunkSize, aIndex * kChunkSize, nullptr);
           NS_ENSURE_SUCCESS(rv, rv);
@@ -2054,6 +2108,7 @@ nsresult CacheFile::Truncate(int64_t aOffset) {
   }
 
   mDataSize = aOffset;
+  mSparseRanges.Truncate(aOffset);
 
   return NS_OK;
 }
@@ -2321,6 +2376,70 @@ bool CacheFile::DataSize(int64_t* aSize) {
   return true;
 }
 
+void CacheFile::MarkRangeWrittenLocked(int64_t aOffset, int64_t aLen) {
+  AssertOwnsLock();
+  mSparseRanges.AddRange(aOffset, aLen);
+}
+
+int64_t CacheFile::FirstHoleAfterLocked(int64_t aOffset) {
+  AssertOwnsLock();
+  return mSparseRanges.FirstHoleAfter(aOffset);
+}
+
+bool CacheFile::IsSparseLocked() {
+  AssertOwnsLock();
+  return !mSparseRanges.IsContiguousFromZero(mDataSize);
+}
+
+bool CacheFile::IsRangeCached(int64_t aOffset, int64_t aLen) {
+  CacheFileAutoLock lock(this);
+  return mSparseRanges.Covers(aOffset, aLen);
+}
+
+bool CacheFile::FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                                    int64_t* aLength) {
+  CacheFileAutoLock lock(this);
+  return mSparseRanges.FirstAvailableRange(aOffset, aStart, aLength);
+}
+
+bool CacheFile::FirstAvailableRangeLocked(int64_t aOffset, int64_t* aStart,
+                                          int64_t* aLength) {
+  AssertOwnsLock();
+  return mSparseRanges.FirstAvailableRange(aOffset, aStart, aLength);
+}
+
+void CacheFile::LoadSparseRangesLocked() {
+  AssertOwnsLock();
+  mSparseRanges.Clear();
+
+  const char* ranges = mMetadata->GetElement(CacheFileUtils::kSparseRangesKey);
+  if (ranges) {
+    mSparseRanges.Parse(nsDependentCString(ranges));
+    return;
+  }
+
+  // No persisted ranges: an ordinary contiguous entry holds all of [0, size).
+  if (mDataSize > 0) {
+    mSparseRanges.AddRange(0, mDataSize);
+  }
+}
+
+void CacheFile::FlushSparseRangesLocked() {
+  AssertOwnsLock();
+
+  if (!IsSparseLocked()) {
+    // Not (or no longer) sparse: drop any stale range metadata.
+    if (mMetadata->GetElement(CacheFileUtils::kSparseRangesKey)) {
+      mMetadata->SetElement(CacheFileUtils::kSparseRangesKey, nullptr);
+    }
+    return;
+  }
+
+  nsAutoCString serialized;
+  mSparseRanges.Serialize(serialized);
+  mMetadata->SetElement(CacheFileUtils::kSparseRangesKey, serialized.get());
+}
+
 nsresult CacheFile::GetAltDataSize(int64_t* aSize) {
   CacheFileAutoLock lock(this);
   if (mOutput) {
@@ -2426,6 +2545,8 @@ void CacheFile::WriteMetadataIfNeededLocked(bool aFireAndForget) {
 
   LOG(("CacheFile::WriteMetadataIfNeededLocked() - Writing metadata [this=%p]",
        this));
+
+  FlushSparseRangesLocked();
 
   rv = mMetadata->WriteMetadata(mDataSize, aFireAndForget ? nullptr : this);
   if (NS_SUCCEEDED(rv)) {
@@ -2569,6 +2690,7 @@ size_t CacheFile::SizeOfExcludingThis(
 
   size_t n = 0;
   n += mKey.SizeOfExcludingThisIfUnshared(mallocSizeOf);
+  n += mSparseRanges.SizeOfExcludingThis(mallocSizeOf);
   n += mChunks.ShallowSizeOfExcludingThis(mallocSizeOf);
   for (const auto& chunk : mChunks.Values()) {
     n += chunk->SizeOfIncludingThis(mallocSizeOf);

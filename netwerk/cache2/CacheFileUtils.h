@@ -21,6 +21,10 @@ namespace CacheFileUtils {
 
 extern const char* kAltDataKey;
 
+// Metadata key under which a sparse (partially-filled) entry's validity ranges
+// are persisted. Only present when the entry has holes.
+extern const char* kSparseRangesKey;
+
 already_AddRefed<nsILoadContextInfo> ParseKey(const nsACString& aKey,
                                               nsACString* aIdEnhance = nullptr,
                                               nsACString* aURISpec = nullptr);
@@ -84,6 +88,66 @@ class ValidityMap {
 
  private:
   nsTArray<ValidityPair> mMap;
+};
+
+// Tracks which byte ranges of a (possibly sparse) cache entry actually contain
+// data. A normal entry is contiguous [0, dataSize); a sparse entry — used for
+// the child entries of HTTP byte-range caching — may have holes. Offsets are
+// entry-relative (within this one entry's data), 64-bit, kept sorted, disjoint
+// and non-adjacent (touching ranges merge). Persisted in entry metadata so
+// holes survive across sessions. Distinct from the transient per-chunk
+// ValidityMap (32-bit, intra-chunk read/write merge): this is whole-entry and
+// persistent, and byte-exact (validity is tracked as ranges, not blocks).
+class SparseRangeMap {
+ public:
+  // Adds [aOffset, aOffset + aLen) to the map, merging overlapping/touching
+  // ranges. A non-positive length is ignored.
+  void AddRange(int64_t aOffset, int64_t aLen);
+
+  // True when [aOffset, aOffset + aLen) is entirely within a single stored
+  // range. A non-positive length is trivially covered.
+  bool Covers(int64_t aOffset, int64_t aLen) const;
+
+  // The first contiguous available run at or after aOffset. Sets *aStart to
+  // where the run begins (== aOffset if data is present there, otherwise the
+  // start of the next run), *aLength to its length, and returns true; returns
+  // false when there is no data at or after aOffset.
+  bool FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                           int64_t* aLength) const;
+
+  // The first byte at or after aOffset that is NOT present. Equals aOffset when
+  // aOffset itself is in a hole (or beyond all ranges).
+  int64_t FirstHoleAfter(int64_t aOffset) const;
+
+  // Sum of all range lengths (bytes actually present, excluding holes).
+  int64_t ValidBytes() const;
+
+  uint32_t Length() const { return mRanges.Length(); }
+
+  // True when the map is a single contiguous range [0, aDataSize) (or empty
+  // with aDataSize == 0): an ordinary, non-sparse entry needing no metadata.
+  bool IsContiguousFromZero(int64_t aDataSize) const;
+
+  // Drops everything at or after aOffset, clipping a range that straddles it.
+  void Truncate(int64_t aOffset);
+
+  void Clear() { mRanges.Clear(); }
+
+  // Canonical ASCII "offset,length;" pairs.
+  void Serialize(nsACString& aOutput) const;
+  // Tolerant of malformed input: stops at the first bad token. Clears first.
+  void Parse(const nsACString& aInput);
+
+  void Log() const;
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+ private:
+  struct Range {
+    int64_t mOffset;
+    int64_t mLen;
+    int64_t End() const { return mOffset + mLen; }
+  };
+  nsTArray<Range> mRanges;
 };
 
 class DetailedCacheHitTelemetry {

@@ -33,6 +33,7 @@
 #include "nsITransport.h"
 #include "nsITransportSecurityInfo.h"
 #include "nsTArray.h"
+#include <utility>
 #include "nsWeakReference.h"
 
 class nsDNSPrefetch;
@@ -43,11 +44,16 @@ class nsIHttpChannelAuthProvider;
 class nsInputStreamPump;
 class nsITransportSecurityInfo;
 
+class nsICacheStorage;
+
 namespace mozilla {
 namespace net {
 
 class nsChannelClassifier;
 class HttpChannelSecurityWarningReporter;
+class SparseRegionReader;
+class SparseMetaResolver;
+enum class SparseMetaResolveKind : uint8_t;
 
 using DNSPromise = MozPromise<nsCOMPtr<nsIDNSRecord>, nsresult, false>;
 
@@ -536,6 +542,148 @@ class nsHttpChannel final : public HttpBaseChannel,
       bool ignoreMissingPartialLen = false);
   [[nodiscard]] nsresult SetupByteRangeRequest(int64_t partialLen);
   void UntieByteRangeRequest();
+
+  // Sparse byte-range caching (bug 1615698). A subrange request that lies
+  // within a single chunk-sized region of the resource is cached as its own
+  // (sparse) cache entry, keyed by the region. TrySetupSparseChunk parses the
+  // request Range, and if it fits one region records mSparseChunk and returns
+  // true; otherwise the request bypasses the cache as before.
+  struct SparseChunkInfo {
+    int64_t mRegionId;  // first region index = requested start / chunk size
+    int64_t
+        mEndRegionId;  // last region index = (requested end - 1) / chunk size
+    int64_t mRegionStart;  // mRegionId * chunk size
+    int64_t mReqStart;     // absolute requested start (inclusive)
+    int64_t mReqEnd;       // absolute requested end (exclusive)
+    // True when the request spans more than one region (handled by the
+    // multi-region serve coordinator rather than the single-region path).
+    bool IsMultiRegion() const { return mEndRegionId != mRegionId; }
+  };
+  bool TrySetupSparseChunk();
+  // Appends the non-sparse base id-extension (POST id / TRR / HEAD / FETCH) to
+  // aExt so sparse write-through can construct the same region-entry keys that
+  // OpenCacheEntryInternal would use for a regular open.
+  void AppendBaseCacheIdExtension(nsACString& aExt);
+  // Returns true if mResponseHead carries enough metadata to safely
+  // sparse-cache (and later If-Range revalidate) a 206: strong validator
+  // (strong ETag or Last-Modified), no non-identity Content-Encoding,
+  // HTTP/1.1+.
+  bool IsSparseCacheableResponse();
+  // Resolves the cache storage (memory / pinning / disk) this channel should
+  // use for its sparse cache entries, matching the selection logic in
+  // OpenCacheEntryInternal. Sparse write-through and meta-entry callers go
+  // through this so they all agree on the storage namespace.
+  nsresult ResolveSparseCacheStorage(nsICacheStorage** aResult);
+  mozilla::Maybe<SparseChunkInfo> mSparseChunk;
+  // Sub-ranges of a multi-range request (Range: bytes=a-b,c-d,...). When
+  // non-empty the request is multi-range; mSparseChunk is left unset and the
+  // multi-range path drives serve/store.
+  nsTArray<std::pair<int64_t, int64_t>> mSparseMultiRangeParts;
+  // Parallel to mSparseMultiRangeParts: the number of region slices each part
+  // contributes to the multi-range serve coordinator's flat slice list (>= 1
+  // when the part fits in one region, >1 when it spans regions).
+  nsTArray<uint32_t> mSparseMultiRangePartSliceCount;
+  // True when the network response for a sparse request should be appended to
+  // an existing (fresh) region entry rather than recreating it, so a region
+  // accumulates multiple sub-ranges. Set in OnCacheEntryCheckSparse.
+  bool mSparseChunkAppend = false;
+  // Coordinator for serving a multi-region request from cache (probes the N
+  // region entries and multiplexes their windowed reads). Held for the
+  // duration of the async probe.
+  RefPtr<SparseRegionReader> mSparseRegionReader;
+  // Coordinator for resolving a suffix / open-ended sub-range request via the
+  // per-URL ":sparsemeta" entry. Held for the duration of the meta-open async
+  // probe; cleared once OnSparseMetaResolved or OnSparseMetaUnresolved fires.
+  RefPtr<SparseMetaResolver> mSparseMetaResolver;
+  // Starts the multi-region serve coordinator (full-coverage -> serve from
+  // cache via OnSparseSpanReady; otherwise OnSparseSpanMiss -> network).
+  [[nodiscard]] nsresult StartSparseMultiRegion(nsICacheStorage* aStorage);
+  // Starts the multi-range serve coordinator (full-coverage -> synthesize
+  // multipart/byteranges from cache; otherwise miss -> network).
+  [[nodiscard]] nsresult StartSparseMultiRange(nsICacheStorage* aStorage);
+  // Hooks the multi-range capture listener around mListener so the network
+  // multipart/byteranges response is also buffered for write-through into
+  // region cache entries.
+  void MaybeInstallSparseMultiRangeCapture();
+  // Single-range write-through (multi-region single-range miss, or suffix /
+  // open-ended ranges resolved by the response Content-Range): wraps mListener
+  // to capture the response body and on completion splits it across the
+  // spanned region cache entries.
+  void MaybeInstallSparseSingleRangeCapture();
+  // Set when the response should be captured and written through across the
+  // spanned region cache entries (cases that don't take the normal sparse
+  // store path: multi-region miss, and suffix / open-ended single ranges).
+  bool mSparseWantWriteThroughSingleRange = false;
+  // When DoInstallCacheListener takes the normal cache-listener path for a
+  // sparse 206, it acquires the per-region SparseWriteQueue slot here so
+  // concurrent SparseMultiRangePartWriters for the same region see us as
+  // the holder and wait. Released in CloseCacheEntry once the tee's cache
+  // output stream has been closed.
+  nsCString mSparseWriteQueueKey;
+  // Writes (or refreshes) the per-URL ":sparsemeta" cache entry so that a
+  // future channel (notably a suffix / open-ended request) can resolve the
+  // entity total without a network round-trip. Idempotent across concurrent
+  // writers; safe to call from every sparse store path that successfully
+  // landed bytes. No-op when the response isn't sparse-cacheable; the
+  // not-sparse sentinel is written by MaybeWriteSparseMetaNotSparse instead.
+  void MaybeWriteSparseMeta(nsICacheStorage* aStorage,
+                            nsHttpResponseHead* aResponseHead, int64_t aTotal);
+  void MaybeWriteSparseMetaNotSparse(nsICacheStorage* aStorage);
+  // Async resolver for suffix / open-ended ranges: looks up the per-URL
+  // ":sparsemeta" entry to learn the entity total, then either dispatches
+  // back into the normal sparse single- / multi-region open path (resolved
+  // to a bounded range) or falls through to the historical bypass + capture
+  // network fetch.
+  [[nodiscard]] nsresult StartSparseMetaResolve(SparseMetaResolveKind aKind,
+                                                int64_t aParam,
+                                                nsICacheStorage* aStorage);
+
+  // Strict validation of mResponseHead's Content-Range against the expected
+  // bounds for a sparse store. Matches Chromium's PartialData::
+  // ResponseHeadersOK shape: requires exact start match, exact end match OR
+  // clamp-to-EOF (only when the request asked beyond entity total), and (when
+  // mSparseMeta* is populated) total + validator agreement with meta.
+  // On success aAcceptedLast receives the effective last byte (== aExpectedLast
+  // unless clamped) and aTotal receives the entity total parsed from the
+  // header. Returns false to mean "do not write through".
+  bool ValidateSparseResponseRange(int64_t aExpectedFirst,
+                                   int64_t aExpectedLast,
+                                   int64_t* aAcceptedLast = nullptr,
+                                   int64_t* aTotal = nullptr);
+  // Populated when meta is resolved (read on the suffix / open-ended path or
+  // read incidentally by other sparse coordinators); used by
+  // ValidateSparseResponseRange to detect total/validator mismatches and by
+  // OnSparseSpanReady to skip the first-region head read in the common case.
+  int64_t mSparseMetaTotal = -1;
+  nsCString mSparseMetaValidator;
+  nsCString mSparseMetaContentType;
+  // Flattened whole-entity 206 head stored in :sparsemeta, normalized so
+  // Content-Range is bytes 0-<total-1>/<total>. Used by OnSparseSpanReady to
+  // skip reading the first region's stored head when the resolver has
+  // already populated this.
+  nsCString mSparseMetaResponseHead;
+  uint64_t mSparseMetaRev = 0;
+  bool mSparseMetaNotSparse = false;
+  // Builds a 206 response head for the current request window [mReqStart,
+  // mReqEnd) from a stored region head (status 206 + Content-Range +
+  // Content-Length).
+  mozilla::UniquePtr<nsHttpResponseHead> BuildSparse206Head(
+      nsHttpResponseHead* aStoredHead);
+  // Decides hit (serve windowed from cache) vs miss (refetch) for a sparse
+  // region entry; called from OnCacheEntryCheck.
+  [[nodiscard]] nsresult OnCacheEntryCheckSparse(nsICacheEntry* aEntry,
+                                                 uint32_t* aResult);
+  // Sets up mCacheInputStream (windowed) and mCachedResponseHead (synth 206) to
+  // serve the requested window from the region entry.
+  [[nodiscard]] nsresult SetupSparseCacheRead(nsICacheEntry* aEntry,
+                                              int64_t aChildOffset,
+                                              int64_t aLen);
+  // Entry-relative offset at which a sparse region's data is written/read; 0
+  // for non-sparse requests.
+  int64_t SparseChildWriteOffset() const {
+    return mSparseChunk ? mSparseChunk->mReqStart - mSparseChunk->mRegionStart
+                        : 0;
+  }
   void UntieValidationRequest();
   [[nodiscard]] nsresult OpenCacheInputStream(nsICacheEntry* cacheEntry,
                                               bool startBuffering);
@@ -923,6 +1071,24 @@ class nsHttpChannel final : public HttpBaseChannel,
   // LNA telemetry: stores the user's action on the permission prompt
   // Values: "allow", "deny", or empty string (no prompt shown)
   nsCString mLNAPromptAction;
+
+ public:
+  // Sparse-caching callbacks. Invoked by the coordinator classes defined in
+  // SparseCache.{h,cpp} when the async cache plumbing they own reaches a
+  // serve / miss decision (or, in the listener case, when the network body
+  // is fully captured for write-through).
+  void OnSparseSpanReady(nsTArray<nsCOMPtr<nsIInputStream>>&& aSliceStreams,
+                         nsICacheEntry* aFirstEntry);
+  void OnSparseSpanMiss();
+  void OnSparseMultiRangeBodyCaptured(nsCString&& aBody,
+                                      const nsACString& aContentType);
+  void OnSparseSingleRangeBodyCaptured(nsCString&& aBody);
+  void OnSparseMetaResolved(int64_t aStart, int64_t aEnd, int64_t aTotal,
+                            const nsACString& aValidator,
+                            const nsACString& aContentType,
+                            const nsACString& aResponseHead, uint64_t aRev,
+                            nsICacheStorage* aStorage);
+  void OnSparseMetaUnresolved();
 };
 
 }  // namespace net

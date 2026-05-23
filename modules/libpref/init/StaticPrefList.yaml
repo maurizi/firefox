@@ -14305,6 +14305,22 @@
   value: false
   mirror: always
 
+# Whether to cache responses to byte-range requests that don't start at byte 0
+# by building up a sparse cache entry (see bug 1615698). When false, such
+# requests bypass the cache entirely (the long-standing behavior).
+- name: network.http.sparse_entries.enabled
+  type: RelaxedAtomicBool
+  value: true
+  mirror: always
+
+# Region (child entry) size, in bytes, for sparse byte-range caching. Each
+# region of a resource is cached as its own entry so it can be evicted
+# independently.
+- name: network.http.sparse_entries.chunk_size
+  type: RelaxedAtomicUint32
+  value: 1048576
+  mirror: always
+
 # Whether to respect the redirected-tainted origin flag
 # https://fetch.spec.whatwg.org/#concept-request-tainted-origin
 - name: network.http.origin.redirectTainted

@@ -7,6 +7,7 @@
 
 #include "CacheEntry.h"
 
+#include "CacheFileInputStream.h"
 #include "CacheFileUtils.h"
 #include "CacheIndex.h"
 #include "CacheLog.h"
@@ -1290,6 +1291,22 @@ nsresult CacheEntry::OpenInputStreamInternal(int64_t offset,
   return NS_OK;
 }
 
+nsresult CacheEntry::OpenBoundedInputStream(int64_t offset,
+                                            int64_t readEndBound,
+                                            nsIInputStream** _retval) {
+  LOG(("CacheEntry::OpenBoundedInputStream [this=%p, offset=%" PRId64
+       ", readEndBound=%" PRId64 "]",
+       this, offset, readEndBound));
+  nsresult rv = OpenInputStreamInternal(offset, nullptr, _retval);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (readEndBound >= 0) {
+    // The stream returned by OpenInputStreamInternal is always a
+    // CacheFileInputStream (created by CacheFile::OpenInputStream).
+    static_cast<CacheFileInputStream*>(*_retval)->SetReadEndBound(readEndBound);
+  }
+  return NS_OK;
+}
+
 nsresult CacheEntry::OpenOutputStream(int64_t offset, int64_t predictedSize,
                                       nsIOutputStream** _retval) {
   LOG(("CacheEntry::OpenOutputStream [this=%p]", this));
@@ -1612,6 +1629,29 @@ nsresult CacheEntry::GetDataSize(int64_t* aDataSize) {
   }
 
   LOG(("  size=%" PRId64, *aDataSize));
+  return NS_OK;
+}
+
+nsresult CacheEntry::IsRangeCached(int64_t aOffset, int64_t aLen,
+                                   bool* _retval) {
+  LOG(("CacheEntry::IsRangeCached [this=%p, offset=%" PRId64 ", len=%" PRId64
+       "]",
+       this, aOffset, aLen));
+  *_retval = false;
+  NS_ENSURE_SUCCESS(mFileStatus, mFileStatus);
+  *_retval = mFile->IsRangeCached(aOffset, aLen);
+  return NS_OK;
+}
+
+nsresult CacheEntry::FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                                         int64_t* aLength, bool* _retval) {
+  LOG(("CacheEntry::FirstAvailableRange [this=%p, offset=%" PRId64 "]", this,
+       aOffset));
+  *aStart = 0;
+  *aLength = 0;
+  *_retval = false;
+  NS_ENSURE_SUCCESS(mFileStatus, mFileStatus);
+  *_retval = mFile->FirstAvailableRange(aOffset, aStart, aLength);
   return NS_OK;
 }
 

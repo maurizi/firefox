@@ -223,12 +223,30 @@ network:
     labels:
       - cacheable
       - not_cacheable
+      - served_from_sparse_cache
+      - sparse_partial_to_network
+      - sparse_revalidation_doomed
+      - sparse_response_range_mismatch
+      - sparse_write_part_succeeded
+      - sparse_capture_oversize
     description: >
-      Counts of cacheable/non-cacheable byte-range requests
+      Counts of byte-range requests by cache outcome. "cacheable" and
+      "not_cacheable" classify the request; the sparse_* labels track sparse
+      cache entries (bug 1615698): served entirely from a sparse cache entry,
+      sent to the network because the requested range wasn't fully cached, the
+      sparse entry was doomed because the resource's validator changed, and
+      the response's Content-Range disagreed with the request so the
+      write-through was suppressed.
+      sparse_write_part_succeeded counts each multipart/byteranges part that
+      was successfully written through to its per-region cache entry.
+      sparse_capture_oversize tracks responses that exceeded the 16 MiB
+      capture buffer cap and were therefore not write-through cached.
     bugs:
       - https://bugzilla.mozilla.org/show_bug.cgi?id=1898737
+      - https://bugzilla.mozilla.org/show_bug.cgi?id=1615698
     data_reviews:
       - https://bugzilla.mozilla.org/show_bug.cgi?id=1898737
+      - https://bugzilla.mozilla.org/show_bug.cgi?id=1615698
     notification_emails:
       - necko@mozilla.com
     expires: never

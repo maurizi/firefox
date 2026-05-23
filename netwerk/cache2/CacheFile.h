@@ -119,6 +119,35 @@ class MOZ_CAPABILITY("mutex") CacheFile final
   nsresult OnFetched();
 
   bool DataSize(int64_t* aSize);
+
+  // Sparse-entry support. A sparse entry (used for HTTP byte-range child
+  // entries) may be only partially filled; mSparseRanges tracks which
+  // entry-relative byte ranges hold data. The *Locked variants require the
+  // CacheFile lock (used by the input/output streams); the others lock
+  // themselves.
+
+  // Records that entry-relative [aOffset, aOffset + aLen) now holds data.
+  // Called by the output stream for actual writes (not zero-fill / hole pad).
+  void MarkRangeWrittenLocked(int64_t aOffset, int64_t aLen) MOZ_REQUIRES(this);
+
+  // First entry-relative byte at or after aOffset that is not present.
+  int64_t FirstHoleAfterLocked(int64_t aOffset) MOZ_REQUIRES(this);
+
+  // Locked variant of FirstAvailableRange (caller already owns the file lock).
+  bool FirstAvailableRangeLocked(int64_t aOffset, int64_t* aStart,
+                                 int64_t* aLength) MOZ_REQUIRES(this);
+
+  // True when the entry has holes (not a single contiguous range from 0).
+  bool IsSparseLocked() MOZ_REQUIRES(this);
+
+  // True if entry-relative [aOffset, aOffset + aLen) is entirely present.
+  bool IsRangeCached(int64_t aOffset, int64_t aLen);
+
+  // First contiguous available run at or after aOffset. On success sets
+  // *aStart/*aLength and returns true; false if no data is present at or after
+  // aOffset.
+  bool FirstAvailableRange(int64_t aOffset, int64_t* aStart, int64_t* aLength);
+
   void Key(nsACString& aKey);
   bool IsDoomed();
   bool IsPinned();
@@ -178,6 +207,11 @@ class MOZ_CAPABILITY("mutex") CacheFile final
   int64_t BytesFromChunk(uint32_t aIndex, bool aAlternativeData);
   nsresult Truncate(int64_t aOffset);
 
+  // Populate mSparseRanges from metadata on load (persisted ranges, else the
+  // identity range [0, mDataSize)); persist them only when the entry is sparse.
+  void LoadSparseRangesLocked() MOZ_REQUIRES(this);
+  void FlushSparseRangesLocked() MOZ_REQUIRES(this);
+
   void RemoveInput(CacheFileInputStream* aInput, nsresult aStatus);
   void RemoveOutput(CacheFileOutputStream* aOutput, nsresult aStatus);
   nsresult NotifyChunkListener(CacheFileChunkListener* aCallback,
@@ -223,6 +257,11 @@ class MOZ_CAPABILITY("mutex") CacheFile final
   // If there is alternative data present, it contains size of the original
   // data, i.e. offset where alternative data starts. Otherwise it is -1.
   int64_t mAltDataOffset MOZ_GUARDED_BY(this){-1};
+
+  // Which entry-relative byte ranges hold data. For a normal entry this is the
+  // single range [0, mDataSize) and is not persisted; for a sparse entry it has
+  // holes and is persisted under kSparseRangesKey.
+  CacheFileUtils::SparseRangeMap mSparseRanges MOZ_GUARDED_BY(this);
 
   nsCString mKey MOZ_GUARDED_BY(this);
   nsCString mAltDataType

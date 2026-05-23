@@ -6,6 +6,7 @@
 #define nsHttp_h_
 
 #include <stdint.h>
+#include <utility>
 #include "prtime.h"
 #include "nsString.h"
 #include "nsError.h"
@@ -248,6 +249,29 @@ const char* FindToken(const char* input, const char* token, const char* seps);
   const char* next;
   return ParseInt64(input, &next, result) && *next == '\0';
 }
+
+// Parses a single-range request Range header value ("bytes=500-999",
+// "bytes=500-", or suffix "bytes=-500") into the absolute half-open interval
+// [*aStart, *aEnd). aTotalSize (the entity total, or -1 if unknown) resolves
+// the open-ended and suffix forms. Returns false for a multi-range value, a
+// malformed/unsatisfiable value, or when the total is needed but unknown.
+[[nodiscard]] bool ParseRequestByteRange(const nsACString& aValue,
+                                         int64_t aTotalSize, int64_t* aStart,
+                                         int64_t* aEnd);
+
+// Parses a multi-range request Range header value ("bytes=a-b,c-d,...") into a
+// list of absolute half-open intervals. Returns false if the value isn't a
+// "bytes=" multi/single range, or any part is malformed/unsatisfiable.
+[[nodiscard]] bool ParseRequestByteRanges(
+    const nsACString& aValue, int64_t aTotalSize,
+    nsTArray<std::pair<int64_t, int64_t>>& aRanges);
+
+// Parses a 206 Content-Range header value ("bytes 500-999/8000") into *aFirst
+// and *aLast (inclusive) and *aTotal (-1 when the total is "*"). Returns false
+// if malformed or unsatisfiable ("bytes */N").
+[[nodiscard]] bool ParseContentRangeHeader(const nsACString& aValue,
+                                           int64_t* aFirst, int64_t* aLast,
+                                           int64_t* aTotal);
 
 // Return whether the HTTP status code represents a permanent redirect
 bool IsPermanentRedirect(uint32_t httpStatus);

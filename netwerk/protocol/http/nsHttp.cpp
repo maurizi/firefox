@@ -262,6 +262,144 @@ bool ParseInt64(const char* input, const char** next, int64_t* r) {
   return true;
 }
 
+// Parses a single range spec without the "bytes=" prefix ("500-999", "500-",
+// or "-500") into the absolute half-open interval [*aStart, *aEnd).
+static bool ParseRangeSpec(const nsACString& aSpec, int64_t aTotalSize,
+                           int64_t* aStart, int64_t* aEnd) {
+  int32_t dash = aSpec.FindChar('-');
+  if (dash < 0) {
+    return false;
+  }
+
+  if (dash == 0) {
+    // Suffix form "-N": the last N bytes; needs the entity total.
+    int64_t suffixLen;
+    if (aTotalSize < 0 ||
+        !ParseInt64(PromiseFlatCString(Substring(aSpec, 1)).get(),
+                    &suffixLen) ||
+        suffixLen <= 0) {
+      return false;
+    }
+    *aStart = (aTotalSize > suffixLen) ? (aTotalSize - suffixLen) : 0;
+    *aEnd = aTotalSize;
+    return *aEnd > *aStart;
+  }
+
+  int64_t first;
+  if (!ParseInt64(PromiseFlatCString(Substring(aSpec, 0, dash)).get(),
+                  &first)) {
+    return false;
+  }
+
+  const nsACString& lastPart = Substring(aSpec, dash + 1);
+  int64_t end;
+  if (lastPart.IsEmpty()) {
+    // Open-ended "first-": to the end of the entity; needs the total.
+    if (aTotalSize < 0) {
+      return false;
+    }
+    end = aTotalSize;
+  } else {
+    int64_t last;
+    if (!ParseInt64(PromiseFlatCString(lastPart).get(), &last)) {
+      return false;
+    }
+    end = last + 1;
+    if (aTotalSize >= 0 && end > aTotalSize) {
+      end = aTotalSize;  // clamp to the entity
+    }
+  }
+
+  if (end <= first) {
+    return false;
+  }
+  *aStart = first;
+  *aEnd = end;
+  return true;
+}
+
+bool ParseRequestByteRange(const nsACString& aValue, int64_t aTotalSize,
+                           int64_t* aStart, int64_t* aEnd) {
+  nsAutoCString value(aValue);
+  value.StripWhitespace();
+
+  // Must be a "bytes=" range with a single range spec.
+  if (value.Length() < 7 ||
+      !Substring(value, 0, 6).LowerCaseEqualsLiteral("bytes=")) {
+    return false;
+  }
+  const nsACString& spec = Substring(value, 6);
+  if (spec.Contains(',')) {
+    return false;  // multi-range; use ParseRequestByteRanges
+  }
+  return ParseRangeSpec(spec, aTotalSize, aStart, aEnd);
+}
+
+bool ParseRequestByteRanges(const nsACString& aValue, int64_t aTotalSize,
+                            nsTArray<std::pair<int64_t, int64_t>>& aRanges) {
+  aRanges.Clear();
+
+  nsAutoCString value(aValue);
+  value.StripWhitespace();
+  if (value.Length() < 7 ||
+      !Substring(value, 0, 6).LowerCaseEqualsLiteral("bytes=")) {
+    return false;
+  }
+
+  for (const auto& spec : Substring(value, 6).Split(',')) {
+    int64_t start, end;
+    if (spec.IsEmpty() || !ParseRangeSpec(spec, aTotalSize, &start, &end)) {
+      aRanges.Clear();
+      return false;
+    }
+    aRanges.AppendElement(std::make_pair(start, end));
+  }
+  return !aRanges.IsEmpty();
+}
+
+bool ParseContentRangeHeader(const nsACString& aValue, int64_t* aFirst,
+                             int64_t* aLast, int64_t* aTotal) {
+  nsAutoCString value(aValue);
+  value.Trim(" \t");
+
+  // "bytes first-last/total".
+  if (value.Length() < 6 ||
+      !Substring(value, 0, 5).LowerCaseEqualsLiteral("bytes")) {
+    return false;
+  }
+  const char* p = value.get() + 5;
+  while (*p == ' ' || *p == '\t') {
+    ++p;
+  }
+  if (*p == '*') {
+    return false;  // unsatisfiable "bytes */N"
+  }
+
+  const char* next = nullptr;
+  int64_t first, last, total;
+  if (!ParseInt64(p, &next, &first) || *next != '-') {
+    return false;
+  }
+  p = next + 1;
+  if (!ParseInt64(p, &next, &last) || *next != '/') {
+    return false;
+  }
+  p = next + 1;
+  if (*p == '*') {
+    total = -1;
+  } else if (!ParseInt64(p, &next, &total)) {
+    return false;
+  }
+
+  if (last < first || (total >= 0 && last >= total)) {
+    return false;
+  }
+  *aFirst = first;
+  *aLast = last;
+  *aTotal = total;
+  return true;
+}
+
 bool IsPermanentRedirect(uint32_t httpStatus) {
   return httpStatus == 301 || httpStatus == 308;
 }

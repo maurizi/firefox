@@ -43,6 +43,19 @@ class CacheFileInputStream : public nsIAsyncInputStream,
     return mChunk ? static_cast<int64_t>(mChunk->Index()) : -1;
   };
 
+  // For sparse reads bounded to a window of [start, start+len). Past the end
+  // CanRead returns 0 (clean EOF) rather than probing the underlying sparse
+  // map, so an adjacent hole right after the window doesn't surface as
+  // NS_ERROR_CACHE_DATA_INCOMPLETE.
+  //
+  // Must be called before the stream is handed to any async consumer (i.e.
+  // before any Read / AsyncWait can race). CacheEntry::OpenBoundedInputStream
+  // is the canonical call site.
+  void SetReadEndBound(int64_t aEnd) {
+    MOZ_ASSERT(!mClosed, "SetReadEndBound called on a closed stream");
+    mReadEndBound = aEnd;
+  }
+
  private:
   virtual ~CacheFileInputStream();
 
@@ -60,6 +73,8 @@ class CacheFileInputStream : public nsIAsyncInputStream,
   RefPtr<CacheFile> mFile;
   RefPtr<CacheFileChunk> mChunk;
   int64_t mPos;
+  // -1 means unbounded. Set via SetReadEndBound for windowed sparse reads.
+  int64_t mReadEndBound = -1;
   nsresult mStatus;
   bool mClosed : 1;
   bool mInReadSegments : 1;

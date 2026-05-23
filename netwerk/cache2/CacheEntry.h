@@ -85,6 +85,8 @@ class CacheEntry final : public nsIRunnable,
   nsresult GetIsForcedValid(bool* aIsForcedValid);
   nsresult MarkForcedValidUse();
   nsresult OpenInputStream(int64_t offset, nsIInputStream** _retval);
+  nsresult OpenBoundedInputStream(int64_t offset, int64_t readEndBound,
+                                  nsIInputStream** _retval);
   nsresult OpenOutputStream(int64_t offset, int64_t predictedSize,
                             nsIOutputStream** _retval);
   nsresult GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo);
@@ -100,6 +102,9 @@ class CacheEntry final : public nsIRunnable,
   nsresult GetDiskStorageSizeInKB(uint32_t* aDiskStorageSizeInKB);
   nsresult Recreate(bool aMemoryOnly, nsICacheEntry** _retval);
   nsresult GetDataSize(int64_t* aDataSize);
+  nsresult IsRangeCached(int64_t aOffset, int64_t aLen, bool* _retval);
+  nsresult FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                               int64_t* aLength, bool* _retval);
   nsresult GetAltDataSize(int64_t* aDataSize);
   nsresult GetAltDataType(nsACString& aAltDataType);
   nsresult OpenAlternativeOutputStream(const nsACString& type,
@@ -508,6 +513,10 @@ class CacheEntryHandle final : public nsICacheEntry {
                              nsIInputStream** _retval) override {
     return mEntry->OpenInputStream(offset, _retval);
   }
+  NS_IMETHOD OpenBoundedInputStream(int64_t offset, int64_t readEndBound,
+                                    nsIInputStream** _retval) override {
+    return mEntry->OpenBoundedInputStream(offset, readEndBound, _retval);
+  }
   NS_IMETHOD OpenOutputStream(int64_t offset, int64_t predictedSize,
                               nsIOutputStream** _retval) override {
     return mEntry->OpenOutputStream(offset, predictedSize, _retval);
@@ -547,6 +556,14 @@ class CacheEntryHandle final : public nsICacheEntry {
   }
   NS_IMETHOD GetDataSize(int64_t* aDataSize) override {
     return mEntry->GetDataSize(aDataSize);
+  }
+  NS_IMETHOD IsRangeCached(int64_t aOffset, int64_t aLen,
+                           bool* _retval) override {
+    return mEntry->IsRangeCached(aOffset, aLen, _retval);
+  }
+  NS_IMETHOD FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                                 int64_t* aLength, bool* _retval) override {
+    return mEntry->FirstAvailableRange(aOffset, aStart, aLength, _retval);
   }
   NS_IMETHOD GetAltDataSize(int64_t* aAltDataSize) override {
     return mEntry->GetAltDataSize(aAltDataSize);

@@ -72,6 +72,7 @@
 #include "mozilla/FlowMarkers.h"
 #include "mozilla/Components.h"
 #include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/SlicedInputStream.h"
 #include "mozilla/StaticPrefs_network.h"
 #include "mozilla/StaticPrefs_privacy.h"
 #include "mozilla/StaticPrefs_security.h"
@@ -92,6 +93,7 @@
 #include "nsICancelable.h"
 #include "nsIHttpChannelInternal.h"
 #include "nsIPrompt.h"
+#include "nsIMultiplexInputStream.h"
 #include "nsInputStreamPump.h"
 #include "nsURLHelper.h"
 #include "nsISiteIntegrityService.h"
@@ -126,6 +128,8 @@
 #include "ThirdPartyUtil.h"
 #include "InterceptedHttpChannel.h"
 #include "../../cache2/CacheFileUtils.h"
+#include "SparseCache.h"
+#include "SparseMeta.h"
 #include "nsINetworkLinkService.h"
 #include "mozilla/ContentBlockingAllowList.h"
 #include "mozilla/dom/ServiceWorkerUtils.h"
@@ -501,6 +505,10 @@ nsHttpChannel::~nsHttpChannel() {
     DebugOnly<nsresult> rv = mAuthProvider->Disconnect(NS_ERROR_ABORT);
     MOZ_ASSERT(NS_SUCCEEDED(rv));
   }
+  // Note: any SparseWriteQueue slot we held is released in CloseCacheEntry,
+  // which is called from every OnStopRequest / cancel / failure path that
+  // reaches a channel teardown. If a channel dies without ever going through
+  // CloseCacheEntry, the slot leaks until process exit; acceptable for now.
 
   if (gHttpHandler) {
     gHttpHandler->RemoveHttpChannel(mChannelId);
@@ -1537,7 +1545,14 @@ nsresult nsHttpChannel::ContinueConnect() {
 
       nsRunnableMethod<nsHttpChannel>* event = nullptr;
       nsresult rv;
-      if (!LoadCachedContentIsPartial()) {
+      // Fire http-on-examine-cached-response for normal cache hits and for
+      // sparse single-region cache hits (mSparseChunk set). The legacy
+      // partial-cache path notifies via OnExamineMergedResponse after the
+      // network completes, but the sparse path serves entirely from cache
+      // here — DevTools needs this observer to mark the request as cached.
+      // Mirrors the call already made for sparse multi-region serves in
+      // OnSparseSpanReady.
+      if (!LoadCachedContentIsPartial() || mSparseChunk) {
         rv = AsyncCall(&nsHttpChannel::AsyncOnExamineCachedResponse, &event);
         if (NS_FAILED(rv)) {
           LOG(("  AsyncCall failed (%08x)", static_cast<uint32_t>(rv)));
@@ -3312,6 +3327,23 @@ nsresult nsHttpChannel::ContinueProcessResponse3(nsresult rv) {
         rv = CallOnStartRequest();
         break;
       }
+      if (mSparseChunk || !mSparseMultiRangeParts.IsEmpty()) {
+        // We made a sparse byte-range request but got the whole entity (the
+        // server ignored Range, or the resource changed). A region entry can't
+        // represent the full entity, so doom any region entry and serve the
+        // response without sparse-caching it.
+        LOG(
+            ("Sparse range request answered with 200; not sparse-caching "
+             "[this=%p]\n",
+             this));
+        if (mCacheEntry) {
+          mCacheEntry->AsyncDoom(nullptr);
+        }
+        mSparseChunk.reset();
+        mSparseMultiRangeParts.Clear();
+        mSparseMultiRangePartSliceCount.Clear();
+        CloseCacheEntry(false);
+      }
       // these can normally be cached
       rv = ProcessNormal();
       MaybeInvalidateCacheEntryForSubsequentGet();
@@ -3479,6 +3511,29 @@ nsresult nsHttpChannel::ContinueProcessResponse3(nsresult rv) {
       }
       break;
 
+    case 416:
+      // Range Not Satisfiable: the request asked for bytes past the resource's
+      // end as the server understands it. Doom any sparse cache state so we
+      // don't keep serving stale ranges, then fall through to ProcessNormal so
+      // the consumer sees the 416. Mirrors Chromium's DoomPartialEntry on 416.
+      if (mSparseChunk) {
+        LOG(("416 with mSparseChunk set; dooming region entry [this=%p]",
+             this));
+#ifndef ANDROID
+        glean::network::byte_range_request
+            .Get("sparse_response_range_mismatch"_ns)
+            .Add(1);
+#endif
+        if (mCacheEntry) {
+          mCacheEntry->AsyncDoom(nullptr);
+          mCacheEntry = nullptr;
+        }
+        mSparseChunk.reset();
+        CloseCacheEntry(false);
+      }
+      rv = ProcessNormal();
+      MaybeInvalidateCacheEntryForSubsequentGet();
+      break;
     case 408:
     case 425:
     case 429:
@@ -3820,6 +3875,32 @@ nsresult nsHttpChannel::ContinueProcessNormal3() {
   }
   nsresult rv = NS_OK;
 
+  // If this is a sparse single-region 206 but the response can't be safely
+  // sparse-cached (no strong validator, or non-identity Content-Encoding),
+  // doom the region entry so we don't poison it; the response still flows to
+  // the consumer.
+  if (mSparseChunk && !IsSparseCacheableResponse()) {
+    LOG(
+        ("ContinueProcessNormal3 [this=%p] sparse single-region response not "
+         "cacheable; dooming region entry",
+         this));
+    if (mCacheEntry) {
+      mCacheEntry->AsyncDoom(nullptr);
+      mCacheEntry = nullptr;
+    }
+    mSparseChunk.reset();
+    // Record the URL as not-sparse-cacheable so future suffix / open-ended
+    // requests can short-circuit the meta resolve and go straight to network
+    // without an unhelpful cache probe.
+    if (mCacheEntryURI) {
+      nsCOMPtr<nsICacheStorage> storage;
+      if (NS_SUCCEEDED(ResolveSparseCacheStorage(getter_AddRefs(storage))) &&
+          storage) {
+        MaybeWriteSparseMetaNotSparse(storage);
+      }
+    }
+  }
+
   // Finish post-ParseDictionary work, must be done after waiting if Suspended
   if (mCacheEntry && !LoadCacheEntryIsReadOnly()) {
     if (mIsDictionaryCompressed || mDictSaving) {
@@ -3837,7 +3918,8 @@ nsresult nsHttpChannel::ContinueProcessNormal3() {
              LoadApplyConversion(), LoadHasAppliedConversion()));
       }
       LOG(("Decompressing before saving into cache [channel=%p]", this));
-      rv = DoInstallCacheListener(mIsDictionaryCompressed || mDictSaving, 0);
+      rv = DoInstallCacheListener(mIsDictionaryCompressed || mDictSaving,
+                                  SparseChildWriteOffset());
       if (NS_FAILED(rv)) {
         LOG_DICTIONARIES(
             ("DoInstallCacheListener FAILED: %x", static_cast<uint32_t>(rv)));
@@ -3875,6 +3957,45 @@ nsresult nsHttpChannel::ContinueProcessNormal3() {
     }
   }
 
+  // Strict validation: a 206 with mSparseChunk set must describe exactly the
+  // requested window (or a legitimate clamp-to-EOF). Without this, a server
+  // returning bytes for a different range would land in this region entry at
+  // the request-derived child offset, poisoning the cache. Mirrors
+  // Chromium's PartialData::ResponseHeadersOK invariant.
+  if (mSparseChunk && mResponseHead && mResponseHead->Status() == 206) {
+    int64_t acceptedLast = -1;
+    if (!ValidateSparseResponseRange(mSparseChunk->mReqStart,
+                                     mSparseChunk->mReqEnd - 1, &acceptedLast,
+                                     nullptr)) {
+      LOG(
+          ("ContinueProcessNormal3 [this=%p] sparse Content-Range mismatch; "
+           "dooming region entry and skipping cache write",
+           this));
+#ifndef ANDROID
+      glean::network::byte_range_request
+          .Get("sparse_response_range_mismatch"_ns)
+          .Add(1);
+#endif
+      if (mCacheEntry) {
+        mCacheEntry->AsyncDoom(nullptr);
+        mCacheEntry = nullptr;
+      }
+      mSparseChunk.reset();
+      CloseCacheEntry(false);
+    } else if (acceptedLast >= 0 && acceptedLast < mSparseChunk->mReqEnd - 1) {
+      // Clamp accepted: shorten the request window to what the server actually
+      // returned so the cache write covers only the delivered bytes.
+      mSparseChunk->mReqEnd = acceptedLast + 1;
+    }
+  }
+
+  // For a multi-range request whose response is multipart/byteranges, wrap
+  // mListener so the body is also captured (then written through to region
+  // entries on completion). Done before CallOnStartRequest so the wrapper sees
+  // the full response.
+  MaybeInstallSparseMultiRangeCapture();
+  MaybeInstallSparseSingleRangeCapture();
+
   rv = CallOnStartRequest();
   if (NS_FAILED(rv)) return rv;
 
@@ -3899,7 +4020,7 @@ nsresult nsHttpChannel::ContinueProcessNormal3() {
                this));
         }
       }
-      rv = InstallCacheListener();
+      rv = InstallCacheListener(SparseChildWriteOffset());
       if (NS_FAILED(rv)) return rv;
     }
   }
@@ -4905,6 +5026,1076 @@ static bool IsSubRangeRequest(nsHttpRequestHead& aRequestHead) {
   return true;
 }
 
+bool nsHttpChannel::IsSparseCacheableResponse() {
+  if (!mResponseHead) return false;
+  if (mResponseHead->Version() < HttpVersion::v1_1) return false;
+  // Range bytes are over the encoded representation; concatenating slices of a
+  // gzip/br/etc. body across cache hits would produce a corrupt stream.
+  nsAutoCString contentEncoding;
+  if (NS_SUCCEEDED(mResponseHead->GetHeader(nsHttp::Content_Encoding,
+                                            contentEncoding))) {
+    nsAutoCString lowerCE(contentEncoding);
+    ToLowerCase(lowerCE);
+    lowerCE.Trim(" \t");
+    if (!lowerCE.IsEmpty() && !lowerCE.EqualsLiteral("identity")) {
+      return false;
+    }
+  }
+  // Need a strong validator (strong ETag or Last-Modified) so a later If-Range
+  // can detect a changed resource.
+  nsAutoCString etag;
+  if (NS_SUCCEEDED(mResponseHead->GetHeader(nsHttp::ETag, etag))) {
+    nsAutoCString trimmed(etag);
+    trimmed.Trim(" \t");
+    if (!StringBeginsWith(trimmed, "W/"_ns) && !trimmed.IsEmpty()) {
+      return true;
+    }
+  }
+  nsAutoCString lm;
+  if (NS_SUCCEEDED(mResponseHead->GetHeader(nsHttp::Last_Modified, lm)) &&
+      !lm.IsEmpty()) {
+    return true;
+  }
+  return false;
+}
+
+void nsHttpChannel::AppendBaseCacheIdExtension(nsACString& aExt) {
+  if (mPostID) {
+    aExt.AppendInt(mPostID);
+  }
+  if (LoadIsTRRServiceChannel()) {
+    aExt.Append("TRR");
+  }
+  if (mRequestHead.IsHead()) {
+    aExt.Append("HEAD");
+  }
+  bool isThirdParty = false;
+  if (StaticPrefs::network_fetch_cache_partition_cross_origin() &&
+      (NS_FAILED(mLoadInfo->TriggeringPrincipal()->IsThirdPartyChannel(
+           this, &isThirdParty)) ||
+       isThirdParty) &&
+      (mLoadInfo->InternalContentPolicyType() == nsIContentPolicy::TYPE_FETCH ||
+       mLoadInfo->InternalContentPolicyType() ==
+           nsIContentPolicy::TYPE_XMLHTTPREQUEST ||
+       mLoadInfo->InternalContentPolicyType() ==
+           nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC ||
+       mLoadInfo->InternalContentPolicyType() ==
+           nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC)) {
+    aExt.Append("FETCH");
+  }
+}
+
+nsresult nsHttpChannel::ResolveSparseCacheStorage(nsICacheStorage** aResult) {
+  *aResult = nullptr;
+  nsCOMPtr<nsICacheStorageService> svc(components::CacheStorage::Service());
+  if (!svc) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  RefPtr<LoadContextInfo> info = GetLoadContextInfo(this);
+  if (!info) {
+    return NS_ERROR_FAILURE;
+  }
+  if (mLoadFlags & INHIBIT_PERSISTENT_CACHING) {
+    return svc->MemoryCacheStorage(info, aResult);
+  }
+  if (LoadPinCacheContent()) {
+    return svc->PinningCacheStorage(info, aResult);
+  }
+  return svc->DiskCacheStorage(info, aResult);
+}
+
+bool nsHttpChannel::ValidateSparseResponseRange(int64_t aExpectedFirst,
+                                                int64_t aExpectedLast,
+                                                int64_t* aAcceptedLast,
+                                                int64_t* aTotal) {
+  if (!mResponseHead) {
+    return false;
+  }
+  nsAutoCString crVal;
+  if (NS_FAILED(mResponseHead->GetHeader(nsHttp::Content_Range, crVal))) {
+    return false;
+  }
+  int64_t first = -1, last = -1, total = -1;
+  if (!nsHttp::ParseContentRangeHeader(crVal, &first, &last, &total) ||
+      first < 0 || last < first || total <= 0) {
+    return false;
+  }
+  if (first != aExpectedFirst) {
+    return false;
+  }
+  int64_t acceptedLast = last;
+  if (last != aExpectedLast) {
+    // Accept the clamp-to-EOF case (client asked past the entity total, server
+    // returned a shorter tail): matches Chromium's PartialData::
+    // ResponseHeadersOK exception at partial_data.cc:346-355.
+    if (aExpectedLast < total - 1 || last != total - 1) {
+      return false;
+    }
+  }
+  // Cross-request consistency when :sparsemeta has been resolved on this
+  // channel: the response must describe the same entity (same total, same
+  // strong validator) as the meta we resolved against.
+  if (mSparseMetaTotal > 0 && total != mSparseMetaTotal) {
+    return false;
+  }
+  if (!mSparseMetaValidator.IsEmpty()) {
+    nsAutoCString validator;
+    SparseMeta::ValidatorKind kind = SparseMeta::ValidatorKind::None;
+    if (SparseMeta::ExtractValidator(mResponseHead.get(), validator, kind) &&
+        !validator.Equals(mSparseMetaValidator)) {
+      return false;
+    }
+  }
+  if (aAcceptedLast) {
+    *aAcceptedLast = acceptedLast;
+  }
+  if (aTotal) {
+    *aTotal = total;
+  }
+  return true;
+}
+
+bool nsHttpChannel::TrySetupSparseChunk() {
+  nsAutoCString rangeHeader;
+  if (NS_FAILED(mRequestHead.GetHeader(nsHttp::Range, rangeHeader))) {
+    return false;
+  }
+
+  // Bounded ranges resolve at open time without the entity total.
+  // Suffix ("bytes=-N") and open-ended ("bytes=N-") forms don't: they can't be
+  // mapped to regions until the response Content-Range supplies the total, so
+  // we let the request go to network and flag it for write-through capture.
+  nsTArray<std::pair<int64_t, int64_t>> ranges;
+  if (!nsHttp::ParseRequestByteRanges(rangeHeader, -1, ranges) ||
+      ranges.IsEmpty()) {
+    if (IsSingleSuffixOrOpenEndedByteRange(rangeHeader)) {
+      mSparseWantWriteThroughSingleRange = true;
+      // OpenCacheEntryInternal will bypass the cache open for this request, so
+      // populate the fields the write-through writer needs to match the keys a
+      // future read would compute.
+      mCacheEntryURI = mURI;
+      AppendBaseCacheIdExtension(mCacheIdExtension);
+      LOG(
+          ("nsHttpChannel::TrySetupSparseChunk [this=%p] suffix/open-ended; "
+           "marking for write-through capture",
+           this));
+    }
+    return false;
+  }
+
+  int64_t chunkSize = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (chunkSize <= 0) {
+    return false;
+  }
+
+  if (ranges.Length() == 1) {
+    int64_t start = ranges[0].first;
+    int64_t end = ranges[0].second;
+    int64_t regionId = start / chunkSize;
+    int64_t endRegionId = (end - 1) / chunkSize;
+    mSparseChunk = Some(SparseChunkInfo{regionId, endRegionId,
+                                        regionId * chunkSize, start, end});
+    LOG(("nsHttpChannel::TrySetupSparseChunk [this=%p] regions=[%" PRId64
+         ", %" PRId64 "] req=[%" PRId64 ", %" PRId64 ")",
+         this, regionId, endRegionId, start, end));
+    return true;
+  }
+
+  // Multi-range: route to the multi-range serve coordinator (full-coverage
+  // assembly into a multipart/byteranges response, else fall back to network).
+  mSparseMultiRangeParts = std::move(ranges);
+  LOG(("nsHttpChannel::TrySetupSparseChunk [this=%p] multi-range parts=%zu",
+       this, mSparseMultiRangeParts.Length()));
+  return true;
+}
+
+nsresult nsHttpChannel::OnCacheEntryCheckSparse(nsICacheEntry* aEntry,
+                                                uint32_t* aResult) {
+  MOZ_ASSERT(mSparseChunk);
+
+  int64_t childOffset = SparseChildWriteOffset();
+  int64_t len = mSparseChunk->mReqEnd - mSparseChunk->mReqStart;
+
+  bool rangeCached = false;
+  nsresult rv = aEntry->IsRangeCached(childOffset, len, &rangeCached);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  // Freshness: usable as-is only when validation isn't forced and it hasn't
+  // expired. (A more precise revalidation/append flow is a later refinement;
+  // for now a non-fresh or not-yet-present region is refetched.)
+  bool fresh = !mCachedResponseHead->MustValidate();
+  if (fresh) {
+    uint32_t expirationTime = nsICacheEntry::NO_EXPIRATION_TIME;
+    (void)aEntry->GetExpirationTime(&expirationTime);
+    if (expirationTime != nsICacheEntry::NO_EXPIRATION_TIME) {
+      uint32_t now = uint32_t(PR_Now() / PR_USEC_PER_SEC);
+      fresh = expirationTime > now;
+    }
+  }
+
+  LOG(
+      ("nsHttpChannel::OnCacheEntryCheckSparse [this=%p] cached=%d fresh=%d "
+       "childOffset=%" PRId64 " len=%" PRId64,
+       this, rangeCached, fresh, childOffset, len));
+
+  if (rangeCached && fresh) {
+    rv = SetupSparseCacheRead(aEntry, childOffset, len);
+    if (NS_SUCCEEDED(rv)) {
+      StoreCachedContentIsValid(CachedContentValidity::Valid);
+      *aResult = ENTRY_WANTED;
+#ifndef ANDROID
+      glean::network::byte_range_request.Get("served_from_sparse_cache"_ns)
+          .Add(1);
+#endif
+      return NS_OK;
+    }
+    LOG(("  sparse cache read setup failed (%08x), refetching",
+         static_cast<uint32_t>(rv)));
+  }
+
+  // Refetch the requested range from the network. If the region entry is still
+  // fresh we append the new sub-range to it (accumulating coverage); if it is
+  // stale we recreate it. Either way ProcessNormal writes at
+  // SparseChildWriteOffset once the (206) response arrives.
+  //
+  // Inject If-Range with the stored strong validator so the server either
+  // returns 206 (same resource, safe to merge/append) or 200 (changed, the
+  // ProcessNormal 200-with-mSparseChunk branch dooms the entry). Skip If-Range
+  // if the caller already supplied one to avoid clobbering an explicit request.
+  if (mCachedResponseHead && !mRequestHead.HasHeader(nsHttp::If_Range)) {
+    nsAutoCString validator;
+    if (NS_SUCCEEDED(mCachedResponseHead->GetHeader(nsHttp::ETag, validator))) {
+      nsAutoCString trimmed(validator);
+      trimmed.Trim(" \t");
+      if (!trimmed.IsEmpty() && !StringBeginsWith(trimmed, "W/"_ns)) {
+        (void)mRequestHead.SetHeader(nsHttp::If_Range, trimmed);
+      } else {
+        validator.Truncate();
+      }
+    }
+    if (validator.IsEmpty()) {
+      nsAutoCString lm;
+      if (NS_SUCCEEDED(
+              mCachedResponseHead->GetHeader(nsHttp::Last_Modified, lm)) &&
+          !lm.IsEmpty()) {
+        (void)mRequestHead.SetHeader(nsHttp::If_Range, lm);
+      }
+    }
+  }
+  mSparseChunkAppend = fresh;
+  StoreCachedContentIsValid(CachedContentValidity::Invalid);
+  *aResult = ENTRY_WANTED;
+#ifndef ANDROID
+  glean::network::byte_range_request.Get("sparse_partial_to_network"_ns).Add(1);
+#endif
+  return NS_OK;
+}
+
+UniquePtr<nsHttpResponseHead> nsHttpChannel::BuildSparse206Head(
+    nsHttpResponseHead* aStoredHead) {
+  int64_t total = aStoredHead->TotalEntitySize();
+  int64_t reqStart = mSparseChunk->mReqStart;
+  int64_t reqEnd = mSparseChunk->mReqEnd;
+
+  // Clone the stored head (validator, content-type, cache-control...) and turn
+  // it into a 206 describing exactly the requested window.
+  auto head = MakeUnique<nsHttpResponseHead>(*aStoredHead);
+  if (NS_FAILED(head->ParseStatusLine("HTTP/1.1 206 Partial Content"_ns))) {
+    return nullptr;
+  }
+  head->SetContentLength(reqEnd - reqStart);
+
+  nsAutoCString contentRange;
+  contentRange.AppendLiteral("bytes ");
+  contentRange.AppendInt(reqStart);
+  contentRange.Append('-');
+  contentRange.AppendInt(reqEnd - 1);
+  contentRange.Append('/');
+  if (total < 0) {
+    contentRange.Append('*');
+  } else {
+    contentRange.AppendInt(total);
+  }
+  if (NS_FAILED(head->SetHeader(nsHttp::Content_Range, contentRange))) {
+    return nullptr;
+  }
+  return head;
+}
+
+nsresult nsHttpChannel::SetupSparseCacheRead(nsICacheEntry* aEntry,
+                                             int64_t aChildOffset,
+                                             int64_t aLen) {
+  auto head = BuildSparse206Head(mCachedResponseHead.get());
+  NS_ENSURE_TRUE(head, NS_ERROR_FAILURE);
+
+  // Open a windowed input stream over the region's cached data. The bounded
+  // variant sets a read-end limit so the stream returns clean EOF past the
+  // window instead of surfacing NS_ERROR_CACHE_DATA_INCOMPLETE for an
+  // adjacent sparse hole.
+  nsCOMPtr<nsIInputStream> base;
+  nsresult rv = aEntry->OpenBoundedInputStream(
+      aChildOffset, aChildOffset + aLen, getter_AddRefs(base));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIInputStream> sliced =
+      new SlicedInputStream(base.forget(), 0, uint64_t(aLen));
+  mCacheInputStream.takeOver(sliced);
+
+  mCachedResponseHead = std::move(head);
+  return NS_OK;
+}
+
+nsresult nsHttpChannel::StartSparseMultiRegion(nsICacheStorage* aStorage) {
+  MOZ_ASSERT(mSparseChunk && mSparseChunk->IsMultiRegion());
+
+  int64_t cs = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (cs <= 0) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  int64_t s = mSparseChunk->mReqStart;
+  int64_t e = mSparseChunk->mReqEnd;
+
+  nsTArray<SparseRegionReader::RegionSlice> regions;
+  for (int64_t c = mSparseChunk->mRegionId; c <= mSparseChunk->mEndRegionId;
+       ++c) {
+    int64_t regionStart = c * cs;
+    int64_t sliceStart = std::max(s, regionStart);
+    int64_t sliceEnd = std::min(e, regionStart + cs);
+    regions.AppendElement(SparseRegionReader::RegionSlice{
+        c, sliceStart - regionStart, sliceEnd - sliceStart});
+  }
+
+  mSparseRegionReader = new SparseRegionReader(
+      this, aStorage, mCacheEntryURI, mCacheIdExtension, std::move(regions));
+  return mSparseRegionReader->Start();
+}
+
+void nsHttpChannel::OnSparseSpanReady(
+    nsTArray<nsCOMPtr<nsIInputStream>>&& aSliceStreams,
+    nsICacheEntry* aFirstEntry) {
+  nsTArray<nsCOMPtr<nsIInputStream>> sliceStreams = std::move(aSliceStreams);
+  mSparseRegionReader = nullptr;
+  StoreWaitForCacheEntry(LoadWaitForCacheEntry() & ~WAIT_FOR_CACHE_ENTRY);
+  // Read the stored region head for total + content-type used in the synth
+  // response (and per-part Content-Range for multi-range). Prefer the
+  // normalized whole-entity head from :sparsemeta when the resolver already
+  // populated it — saves one cache-entry head-read per multi-region serve.
+  auto storedHead = MakeUnique<nsHttpResponseHead>();
+  nsresult rv = NS_ERROR_NOT_AVAILABLE;
+  if (!mSparseMetaResponseHead.IsEmpty()) {
+    rv = storedHead->ParseCachedHead(mSparseMetaResponseHead.get());
+  }
+  if (NS_FAILED(rv)) {
+    rv = nsHttp::GetHttpResponseHeadFromCacheEntry(aFirstEntry,
+                                                   storedHead.get());
+  }
+  if (NS_FAILED(rv)) {
+    LOG(("OnSparseSpanReady: failed to read stored head (%08x); fallback",
+         static_cast<uint32_t>(rv)));
+    OnSparseSpanMiss();
+    return;
+  }
+
+  nsCOMPtr<nsIMultiplexInputStream> multiplex =
+      do_CreateInstance("@mozilla.org/io/multiplex-input-stream;1");
+  if (!multiplex) {
+    OnSparseSpanMiss();
+    return;
+  }
+
+  UniquePtr<nsHttpResponseHead> synthHead;
+
+  nsAutoCString reqRangeForLog;
+  (void)mRequestHead.GetHeader(nsHttp::Range, reqRangeForLog);
+  if (!mSparseMultiRangeParts.IsEmpty()) {
+    LOG(
+        ("nsHttpChannel::OnSparseSpanReady [this=%p] serving multi-range "
+         "(%zu parts) from cache req=%s",
+         this, mSparseMultiRangeParts.Length(), reqRangeForLog.get()));
+    // Multi-range path: build a multipart/byteranges body interleaving literal
+    // MIME framing with the cached slice streams. Each part may have been
+    // split across multiple regions; consume mSparseMultiRangePartSliceCount[i]
+    // consecutive slice streams per part.
+    MOZ_ASSERT(mSparseMultiRangePartSliceCount.Length() ==
+               mSparseMultiRangeParts.Length());
+
+    int64_t total = storedHead->TotalEntitySize();
+    nsAutoCString contentType;
+    storedHead->ContentType(contentType);
+    if (contentType.IsEmpty()) {
+      contentType.AssignLiteral("application/octet-stream");
+    }
+
+    nsAutoCString boundary;
+    GenerateBoundary(boundary);
+
+    int64_t bodyLen = 0;
+    size_t streamIdx = 0;
+    for (size_t i = 0; i < mSparseMultiRangeParts.Length(); ++i) {
+      int64_t s = mSparseMultiRangeParts[i].first;
+      int64_t e = mSparseMultiRangeParts[i].second;
+      nsAutoCString header;
+      if (i > 0) {
+        header.AppendLiteral("\r\n");
+      }
+      header.AppendLiteral("--");
+      header.Append(boundary);
+      header.AppendLiteral("\r\nContent-Type: ");
+      header.Append(contentType);
+      header.AppendLiteral("\r\nContent-Range: bytes ");
+      header.AppendInt(s);
+      header.Append('-');
+      header.AppendInt(e - 1);
+      header.Append('/');
+      if (total < 0) {
+        header.Append('*');
+      } else {
+        header.AppendInt(total);
+      }
+      header.AppendLiteral("\r\n\r\n");
+
+      nsCOMPtr<nsIInputStream> literalStream;
+      if (NS_FAILED(NS_NewCStringInputStream(getter_AddRefs(literalStream),
+                                             header))) {
+        OnSparseSpanMiss();
+        return;
+      }
+      multiplex->AppendStream(literalStream);
+      uint32_t slicesForThisPart = mSparseMultiRangePartSliceCount[i];
+      for (uint32_t j = 0; j < slicesForThisPart; ++j) {
+        MOZ_ASSERT(streamIdx < sliceStreams.Length());
+        multiplex->AppendStream(sliceStreams[streamIdx++]);
+      }
+      bodyLen += header.Length() + (e - s);
+    }
+    MOZ_ASSERT(streamIdx == sliceStreams.Length());
+
+    nsAutoCString trailer;
+    trailer.AppendLiteral("\r\n--");
+    trailer.Append(boundary);
+    trailer.AppendLiteral("--\r\n");
+    nsCOMPtr<nsIInputStream> trailerStream;
+    if (NS_FAILED(
+            NS_NewCStringInputStream(getter_AddRefs(trailerStream), trailer))) {
+      OnSparseSpanMiss();
+      return;
+    }
+    multiplex->AppendStream(trailerStream);
+    bodyLen += trailer.Length();
+
+    synthHead = MakeUnique<nsHttpResponseHead>(*storedHead);
+    if (NS_FAILED(
+            synthHead->ParseStatusLine("HTTP/1.1 206 Partial Content"_ns))) {
+      OnSparseSpanMiss();
+      return;
+    }
+    synthHead->ClearHeader(nsHttp::Content_Range);
+    nsAutoCString ct;
+    ct.AppendLiteral("multipart/byteranges; boundary=");
+    ct.Append(boundary);
+    if (NS_FAILED(synthHead->SetHeader(nsHttp::Content_Type, ct))) {
+      OnSparseSpanMiss();
+      return;
+    }
+    synthHead->SetContentLength(bodyLen);
+  } else {
+    LOG(
+        ("nsHttpChannel::OnSparseSpanReady [this=%p] serving multi-region span "
+         "from cache; %zu slices req=%s",
+         this, sliceStreams.Length(), reqRangeForLog.get()));
+    // Multi-region path: plain concatenation of slices served as one 206.
+    for (size_t i = 0; i < sliceStreams.Length(); ++i) {
+      LOG(("  slice[%zu] stream=%p", i, sliceStreams[i].get()));
+      multiplex->AppendStream(sliceStreams[i]);
+    }
+    synthHead = BuildSparse206Head(storedHead.get());
+    if (!synthHead) {
+      OnSparseSpanMiss();
+      return;
+    }
+  }
+
+  nsCOMPtr<nsIInputStream> stream = do_QueryInterface(multiplex);
+  mCacheEntry = aFirstEntry;
+  mCachedResponseHead = std::move(synthHead);
+  mCacheInputStream.takeOver(stream);
+  StoreCachedContentIsValid(CachedContentValidity::Valid);
+#ifndef ANDROID
+  glean::network::byte_range_request.Get("served_from_sparse_cache"_ns).Add(1);
+#endif
+  // Fire http-on-examine-cached-response so observers (notably DevTools) see
+  // the synthesized 206 + Content-Range and report this as a real cache hit
+  // instead of status=0 with no response headers. AsyncCall (matching the
+  // normal cache-hit path in ContinueConnect) defers the notification until
+  // after ReadFromCache has moved mCachedResponseHead into mResponseHead.
+  nsRunnableMethod<nsHttpChannel>* unused = nullptr;
+  (void)AsyncCall(&nsHttpChannel::AsyncOnExamineCachedResponse, &unused);
+  rv = ReadFromCache();
+  if (NS_SUCCEEDED(rv)) {
+    return;
+  }
+
+  LOG(("OnSparseSpanReady: ReadFromCache failed (%08x); fallback",
+       static_cast<uint32_t>(rv)));
+  mCachedResponseHead = nullptr;
+  mCacheInputStream.CloseAndRelease();
+  mCacheEntry = nullptr;
+  StoreCachedContentIsValid(CachedContentValidity::Invalid);
+  OnSparseSpanMiss();
+}
+
+void nsHttpChannel::OnSparseSpanMiss() {
+  nsAutoCString reqRangeForLog;
+  (void)mRequestHead.GetHeader(nsHttp::Range, reqRangeForLog);
+  LOG(
+      ("nsHttpChannel::OnSparseSpanMiss [this=%p] req=%s not fully cached; "
+       "fetching from network",
+       this, reqRangeForLog.get()));
+  mSparseRegionReader = nullptr;
+  // A multi-region single-range miss can still be written through to the
+  // spanned region entries by capturing the response body; flag it so
+  // ContinueProcessNormal3 installs the single-range capture. (For multi-range
+  // we keep mSparseMultiRangeParts so the multipart capture handles the same
+  // job.)
+  if (mSparseChunk && mSparseChunk->IsMultiRegion()) {
+    mSparseWantWriteThroughSingleRange = true;
+  }
+  mSparseChunk.reset();
+  StoreWaitForCacheEntry(LoadWaitForCacheEntry() & ~WAIT_FOR_CACHE_ENTRY);
+#ifndef ANDROID
+  glean::network::byte_range_request.Get("sparse_partial_to_network"_ns).Add(1);
+#endif
+  (void)TriggerNetwork();
+}
+
+nsresult nsHttpChannel::StartSparseMultiRange(nsICacheStorage* aStorage) {
+  MOZ_ASSERT(!mSparseMultiRangeParts.IsEmpty());
+
+  int64_t cs = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (cs <= 0) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  // Split each sub-range across the regions it spans (commonly one region; a
+  // sub-range straddling a region boundary contributes 2+ region slices). The
+  // serve coordinator probes all of them; per-part slice counts let
+  // OnSparseSpanReady regroup the flat slice list back into one multiplexed
+  // stream per multi-range part.
+  nsTArray<SparseRegionReader::RegionSlice> regions;
+  mSparseMultiRangePartSliceCount.Clear();
+  for (const auto& part : mSparseMultiRangeParts) {
+    int64_t s = part.first;
+    int64_t e = part.second;
+    uint32_t sliceCount = 0;
+    int64_t pos = s;
+    while (pos < e) {
+      int64_t c = pos / cs;
+      int64_t regionEnd = (c + 1) * cs;
+      int64_t sliceEnd = std::min(e, regionEnd);
+      regions.AppendElement(
+          SparseRegionReader::RegionSlice{c, pos - c * cs, sliceEnd - pos});
+      pos = sliceEnd;
+      ++sliceCount;
+    }
+    mSparseMultiRangePartSliceCount.AppendElement(sliceCount);
+  }
+
+  mSparseRegionReader = new SparseRegionReader(
+      this, aStorage, mCacheEntryURI, mCacheIdExtension, std::move(regions));
+  return mSparseRegionReader->Start();
+}
+
+void nsHttpChannel::OnSparseMultiRangeBodyCaptured(
+    nsCString&& aBody, const nsACString& aContentType) {
+  // Extract the boundary from "multipart/byteranges; boundary=..."
+  nsAutoCString ct(aContentType);
+  ToLowerCase(ct);
+  auto bpos = ct.Find("boundary=");
+  if (bpos == kNotFound) return;
+  nsAutoCString boundary(Substring(aContentType, bpos + 9));
+  boundary.Trim(" \t");
+  if (boundary.Length() >= 2 && boundary[0] == '"' && boundary.Last() == '"') {
+    boundary = Substring(boundary, 1, boundary.Length() - 2);
+  }
+  // The boundary value may be followed by other parameters; drop everything
+  // after the first ';'.
+  auto semi = boundary.FindChar(';');
+  if (semi != kNotFound) {
+    boundary.Truncate(semi);
+    boundary.Trim(" \t");
+  }
+  if (boundary.IsEmpty()) return;
+
+  int64_t cs = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (cs <= 0) return;
+
+  nsCString delim;
+  delim.AssignLiteral("--");
+  delim.Append(boundary);
+
+  nsTArray<SparseMultiRangePartWriter::Part> parts;
+
+  // Walk parts. Find the first delimiter; then for each delimiter find the
+  // header block (\r\n\r\n), parse Content-Range, find the next delimiter as
+  // the body terminator.
+  size_t pos = 0;
+  auto firstDelim = aBody.Find(delim, pos);
+  if (firstDelim == kNotFound) return;
+  pos = firstDelim + delim.Length();
+
+  while (pos < aBody.Length()) {
+    // Skip CRLF after delimiter, or "--" terminator.
+    if (pos + 1 < aBody.Length() && aBody[pos] == '-' &&
+        aBody[pos + 1] == '-') {
+      break;  // closing boundary
+    }
+    if (pos + 1 < aBody.Length() && aBody[pos] == '\r' &&
+        aBody[pos + 1] == '\n') {
+      pos += 2;
+    }
+    int64_t first = -1, last = -1, total = -1;
+    if (!ParsePartHeaders(aBody, &pos, &first, &last, &total) || first < 0) {
+      // Malformed part; skip to next delimiter.
+      auto next = aBody.Find(delim, pos);
+      if (next == kNotFound) break;
+      pos = next + delim.Length();
+      continue;
+    }
+    // Body runs from pos to the next delimiter, minus the preceding CRLF.
+    auto next = aBody.Find(delim, pos);
+    if (next == kNotFound) break;
+    size_t bodyEnd = next;
+    if (bodyEnd >= 2 && aBody[bodyEnd - 2] == '\r' &&
+        aBody[bodyEnd - 1] == '\n') {
+      bodyEnd -= 2;
+    }
+    int64_t sliceLen = last - first + 1;
+    if (sliceLen <= 0 || pos + sliceLen > bodyEnd) {
+      pos = next + delim.Length();
+      continue;
+    }
+    // Strict per-part validation: drop unsolicited parts (a server returning
+    // bytes the client never asked for). The part's (first, last+1) must
+    // match one of the requested sub-ranges exactly. Mirrors Chromium's
+    // PartialData::ResponseHeadersOK applied per part.
+    bool partRequested = false;
+    for (const auto& req : mSparseMultiRangeParts) {
+      if (req.first == first && req.second == last + 1) {
+        partRequested = true;
+        break;
+      }
+    }
+    if (!partRequested) {
+      LOG(
+          ("OnSparseMultiRangeBodyCaptured: dropping unsolicited part "
+           "[%" PRId64 "-%" PRId64 "]",
+           first, last));
+#ifndef ANDROID
+      glean::network::byte_range_request
+          .Get("sparse_response_range_mismatch"_ns)
+          .Add(1);
+#endif
+      pos = next + delim.Length();
+      continue;
+    }
+    // Split this part across the regions it spans (single-region is the trivial
+    // case of one slice).
+    PushRegionSlices(parts, Substring(aBody, pos, sliceLen), first, last, total,
+                     cs);
+    pos = next + delim.Length();
+  }
+
+  if (parts.IsEmpty()) return;
+
+  LOG(
+      ("nsHttpChannel::OnSparseMultiRangeBodyCaptured [this=%p] writing %zu "
+       "parts through to region cache entries",
+       this, parts.Length()));
+
+  // Build the writer with the channel's cache storage + per-part state.
+  nsCOMPtr<nsICacheStorage> storage;
+  if (NS_FAILED(ResolveSparseCacheStorage(getter_AddRefs(storage))) ||
+      !storage) {
+    return;
+  }
+
+  // Capture the total before std::move(parts) for the meta write below.
+  int64_t metaTotal = parts.IsEmpty() ? -1 : parts[0].mTotal;
+  // The writer appends ":sparsechunk=<id>" per part, so pass just the base
+  // extension. mCacheIdExtension may already contain ":sparsechunk=N" when
+  // the channel went through the bounded single-region path before falling
+  // back to capture; rebuilding the base from scratch keeps keys clean.
+  nsAutoCString idExtensionBase;
+  AppendBaseCacheIdExtension(idExtensionBase);
+  RefPtr<SparseMultiRangePartWriter> writer =
+      new SparseMultiRangePartWriter(storage, mCacheEntryURI, idExtensionBase,
+                                     mResponseHead.get(), std::move(parts));
+  (void)writer->Start();
+  // Stamp the per-URL meta entry with the total + validator (every part of
+  // a single multipart response carries the same entity total).
+  MaybeWriteSparseMeta(storage, mResponseHead.get(), metaTotal);
+  // The writer is refcounted via the cache callbacks; we don't need to hold it.
+}
+
+void nsHttpChannel::OnSparseSingleRangeBodyCaptured(nsCString&& aBody) {
+  if (!mResponseHead || !mCacheEntryURI) return;
+
+  nsAutoCString crVal;
+  if (NS_FAILED(mResponseHead->GetHeader(nsHttp::Content_Range, crVal))) {
+    return;
+  }
+  int64_t first = -1, last = -1, total = -1;
+  if (!nsHttp::ParseContentRangeHeader(crVal, &first, &last, &total) ||
+      first < 0 || last < first || total < 0) {
+    // No total → can't safely write a region entry (a later sparse read needs
+    // it to validate Content-Range). Bypass cache.
+    return;
+  }
+
+  // Strict validation: when the original request was a bounded sub-range (i.e.
+  // the channel went through the multi-region miss path, not suffix /
+  // open-ended bypass), the response's range must match exactly (with the
+  // clamp-to-EOF carve-out). Suffix / open-ended requests have no exact
+  // expected bounds — the response defines them — so we only require
+  // first <= last && total > 0 (already checked above).
+  nsAutoCString rangeHeader;
+  bool suffixOrOpenEnded = false;
+  if (NS_SUCCEEDED(mRequestHead.GetHeader(nsHttp::Range, rangeHeader))) {
+    SparseMetaResolveKind kind = SparseMetaResolveKind::Suffix;
+    int64_t param = 0;
+    suffixOrOpenEnded =
+        ParseSingleSuffixOrOpenEndedByteRange(rangeHeader, &kind, &param);
+    if (!suffixOrOpenEnded) {
+      nsTArray<std::pair<int64_t, int64_t>> req;
+      if (nsHttp::ParseRequestByteRanges(rangeHeader, -1, req) &&
+          req.Length() == 1) {
+        // ParseRequestByteRanges returns [first, last+1) half-open; convert
+        // to inclusive last for ValidateSparseResponseRange.
+        int64_t expectFirst = req[0].first;
+        int64_t expectLast = req[0].second - 1;
+        int64_t accepted = -1;
+        if (!ValidateSparseResponseRange(expectFirst, expectLast, &accepted,
+                                         nullptr)) {
+          LOG(
+              ("OnSparseSingleRangeBodyCaptured: strict range mismatch; "
+               "request=[%" PRId64 ",%" PRId64 "] response=[%" PRId64
+               ",%" PRId64 "]; skipping write-through",
+               expectFirst, expectLast, first, last));
+#ifndef ANDROID
+          glean::network::byte_range_request
+              .Get("sparse_response_range_mismatch"_ns)
+              .Add(1);
+#endif
+          return;
+        }
+        if (accepted >= 0 && accepted != expectLast) {
+          last = accepted;
+        }
+      }
+    } else if (mSparseMetaTotal > 0) {
+      // Suffix / open-ended request that came through the resolver: enforce
+      // the resolved bounds, not the response's self-reported ones.
+      int64_t expectFirst, expectLast;
+      if (kind == SparseMetaResolveKind::Suffix) {
+        int64_t n = std::min(param, mSparseMetaTotal);
+        expectFirst = mSparseMetaTotal - n;
+        expectLast = mSparseMetaTotal - 1;
+      } else {
+        expectFirst = param;
+        expectLast = mSparseMetaTotal - 1;
+      }
+      int64_t accepted = -1;
+      if (!ValidateSparseResponseRange(expectFirst, expectLast, &accepted,
+                                       nullptr)) {
+        LOG(
+            ("OnSparseSingleRangeBodyCaptured: resolved suffix/open-ended "
+             "range mismatch; skipping write-through"));
+#ifndef ANDROID
+        glean::network::byte_range_request
+            .Get("sparse_response_range_mismatch"_ns)
+            .Add(1);
+#endif
+        return;
+      }
+    }
+  }
+
+  int64_t cs = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (cs <= 0) return;
+
+  int64_t expected = last - first + 1;
+  if (int64_t(aBody.Length()) != expected) {
+    LOG(
+        ("OnSparseSingleRangeBodyCaptured: body length %zu != Content-Range "
+         "extent %" PRId64 "; skipping write-through",
+         aBody.Length(), expected));
+    return;
+  }
+
+  nsTArray<SparseMultiRangePartWriter::Part> parts;
+  PushRegionSlices(parts, aBody, first, last, total, cs);
+  if (parts.IsEmpty()) return;
+
+  LOG(
+      ("nsHttpChannel::OnSparseSingleRangeBodyCaptured [this=%p] writing %zu "
+       "region slice(s) through to cache",
+       this, parts.Length()));
+
+  nsCOMPtr<nsICacheStorage> storage;
+  if (NS_FAILED(ResolveSparseCacheStorage(getter_AddRefs(storage))) ||
+      !storage) {
+    return;
+  }
+
+  // Same key-hygiene as the multi-range capture path: rebuild the base
+  // extension fresh so we don't end up with ":sparsechunk=N:sparsechunk=M".
+  nsAutoCString idExtensionBase;
+  AppendBaseCacheIdExtension(idExtensionBase);
+  RefPtr<SparseMultiRangePartWriter> writer =
+      new SparseMultiRangePartWriter(storage, mCacheEntryURI, idExtensionBase,
+                                     mResponseHead.get(), std::move(parts));
+  (void)writer->Start();
+  // Stamp the per-URL meta entry; total is already validated above.
+  MaybeWriteSparseMeta(storage, mResponseHead.get(), total);
+}
+
+void nsHttpChannel::MaybeInstallSparseMultiRangeCapture() {
+  if (mSparseMultiRangeParts.IsEmpty() || !mResponseHead ||
+      mResponseHead->Status() != 206 || !mListener) {
+    return;
+  }
+  nsAutoCString contentType;
+  if (NS_FAILED(mResponseHead->GetHeader(nsHttp::Content_Type, contentType))) {
+    return;
+  }
+  nsAutoCString lowerCT(contentType);
+  ToLowerCase(lowerCT);
+  if (!StringBeginsWith(lowerCT, "multipart/byteranges"_ns)) {
+    return;
+  }
+  if (!IsSparseCacheableResponse()) {
+    LOG(
+        ("nsHttpChannel::MaybeInstallSparseMultiRangeCapture [this=%p] "
+         "response not cacheable; skipping write-through",
+         this));
+    // Mark the URL not-sparse so future channels skip cache lookups.
+    if (mCacheEntryURI) {
+      nsCOMPtr<nsICacheStorage> storage;
+      if (NS_SUCCEEDED(ResolveSparseCacheStorage(getter_AddRefs(storage))) &&
+          storage) {
+        MaybeWriteSparseMetaNotSparse(storage);
+      }
+    }
+    return;
+  }
+  LOG((
+      "nsHttpChannel::MaybeInstallSparseMultiRangeCapture [this=%p] installing "
+      "capture listener for write-through",
+      this));
+  RefPtr<SparseMultiRangeCaptureListener> capture =
+      new SparseMultiRangeCaptureListener(this, mListener, contentType);
+  mListener = capture;
+}
+
+void nsHttpChannel::MaybeInstallSparseSingleRangeCapture() {
+  if (!mSparseWantWriteThroughSingleRange || !mResponseHead ||
+      mResponseHead->Status() != 206 || !mListener) {
+    return;
+  }
+  // Only single-range 206 responses; multi-range responses have already been
+  // claimed by the multipart capture in MaybeInstallSparseMultiRangeCapture.
+  nsAutoCString contentType;
+  if (NS_SUCCEEDED(
+          mResponseHead->GetHeader(nsHttp::Content_Type, contentType))) {
+    nsAutoCString lowerCT(contentType);
+    ToLowerCase(lowerCT);
+    if (StringBeginsWith(lowerCT, "multipart/byteranges"_ns)) {
+      return;
+    }
+  }
+  // Need a Content-Range with a known total to write-through; otherwise nothing
+  // to do here (the writer rejects it anyway, but skipping the install avoids
+  // pointless buffering).
+  nsAutoCString crVal;
+  if (NS_FAILED(mResponseHead->GetHeader(nsHttp::Content_Range, crVal))) {
+    return;
+  }
+  int64_t first, last, total;
+  if (!nsHttp::ParseContentRangeHeader(crVal, &first, &last, &total) ||
+      total < 0) {
+    return;
+  }
+  if (!IsSparseCacheableResponse()) {
+    LOG(
+        ("nsHttpChannel::MaybeInstallSparseSingleRangeCapture [this=%p] "
+         "response not cacheable; skipping write-through",
+         this));
+    // Mark the URL not-sparse so future channels skip cache lookups.
+    if (mCacheEntryURI) {
+      nsCOMPtr<nsICacheStorage> storage;
+      if (NS_SUCCEEDED(ResolveSparseCacheStorage(getter_AddRefs(storage))) &&
+          storage) {
+        MaybeWriteSparseMetaNotSparse(storage);
+      }
+    }
+    return;
+  }
+  LOG(
+      ("nsHttpChannel::MaybeInstallSparseSingleRangeCapture [this=%p] "
+       "installing capture for single-range write-through (range %" PRId64
+       "-%" PRId64 "/%" PRId64 ")",
+       this, first, last, total));
+  RefPtr<SparseSingleRangeCaptureListener> capture =
+      new SparseSingleRangeCaptureListener(this, mListener);
+  mListener = capture;
+}
+
+void nsHttpChannel::MaybeWriteSparseMeta(nsICacheStorage* aStorage,
+                                         nsHttpResponseHead* aResponseHead,
+                                         int64_t aTotal) {
+  if (!StaticPrefs::network_http_sparse_entries_enabled() || !aStorage ||
+      !aResponseHead || aTotal <= 0 || !mCacheEntryURI) {
+    return;
+  }
+  SparseMeta::Record record;
+  record.mTotal = aTotal;
+  if (!SparseMeta::ExtractValidator(aResponseHead, record.mValidator,
+                                    record.mKind)) {
+    // No strong validator means the response isn't sparse-cacheable; the
+    // caller should already have routed to the not-sparse sentinel writer.
+    return;
+  }
+  aResponseHead->ContentType(record.mContentType);
+  if (record.mContentType.IsEmpty()) {
+    record.mContentType.AssignLiteral("application/octet-stream");
+  }
+  (void)aResponseHead->GetHeader(nsHttp::Content_Encoding,
+                                 record.mContentEncoding);
+
+  // Normalize the stored head to the whole-entity 206 shape so a later read
+  // of mResponseHead off this meta entry can be rewritten per-request the
+  // same way BuildSparse206Head treats a region's stored head.
+  auto head = MakeUnique<nsHttpResponseHead>(*aResponseHead);
+  (void)head->ParseStatusLine("HTTP/1.1 206 Partial Content"_ns);
+  nsAutoCString contentRange;
+  contentRange.AppendLiteral("bytes 0-");
+  contentRange.AppendInt(aTotal - 1);
+  contentRange.Append('/');
+  contentRange.AppendInt(aTotal);
+  (void)head->SetHeader(nsHttp::Content_Range, contentRange);
+  head->SetContentLength(aTotal);
+  head->Flatten(record.mResponseHead, true);
+
+  // Meta entries key off the base extension only; mCacheIdExtension already
+  // has ":sparsechunk=N" appended for the region we just wrote, so rebuild
+  // the base here to share the key with the read side.
+  nsAutoCString ext;
+  AppendBaseCacheIdExtension(ext);
+  SparseMeta::AppendMetaExtension(ext);
+  LOG(
+      ("nsHttpChannel::MaybeWriteSparseMeta [this=%p] writing meta "
+       "total=%" PRId64 " validator='%s' kind=%s",
+       this, aTotal, record.mValidator.get(),
+       SparseMeta::ValidatorKindToString(record.mKind)));
+  RefPtr<SparseMetaWriter> writer =
+      new SparseMetaWriter(aStorage, mCacheEntryURI, ext, std::move(record));
+  (void)writer->Start();
+}
+
+nsresult nsHttpChannel::StartSparseMetaResolve(SparseMetaResolveKind aKind,
+                                               int64_t aParam,
+                                               nsICacheStorage* aStorage) {
+  MOZ_ASSERT(aStorage);
+  mSparseMetaResolver = new SparseMetaResolver(
+      this, aStorage, mCacheEntryURI, mCacheIdExtension, aKind, aParam);
+  LOG(("nsHttpChannel::StartSparseMetaResolve [this=%p] kind=%d param=%" PRId64,
+       this, int(aKind), aParam));
+  return mSparseMetaResolver->Start();
+}
+
+void nsHttpChannel::OnSparseMetaResolved(
+    int64_t aStart, int64_t aEnd, int64_t aTotal, const nsACString& aValidator,
+    const nsACString& aContentType, const nsACString& aResponseHead,
+    uint64_t aRev, nsICacheStorage* aStorage) {
+  mSparseMetaResolver = nullptr;
+  mSparseMetaTotal = aTotal;
+  mSparseMetaValidator = aValidator;
+  mSparseMetaContentType = aContentType;
+  mSparseMetaResponseHead = aResponseHead;
+  mSparseMetaRev = aRev;
+  LOG(("nsHttpChannel::OnSparseMetaResolved [this=%p] [%" PRId64 ", %" PRId64
+       ") of %" PRId64,
+       this, aStart, aEnd, aTotal));
+
+  // Synthesize the same mSparseChunk routing TrySetupSparseChunk would set
+  // for a bounded `bytes=aStart-(aEnd-1)` request.
+  int64_t cs = StaticPrefs::network_http_sparse_entries_chunk_size();
+  if (cs <= 0) {
+    OnSparseMetaUnresolved();
+    return;
+  }
+  int64_t regionId = aStart / cs;
+  int64_t endRegionId = (aEnd - 1) / cs;
+  mSparseChunk =
+      Some(SparseChunkInfo{regionId, endRegionId, regionId * cs, aStart, aEnd});
+
+  // Append :sparsechunk=<id> for single-region paths; the multi-region
+  // coordinator opens per-region entries itself with its own extension.
+  if (!mSparseChunk->IsMultiRegion()) {
+    mCacheIdExtension.AppendLiteral(":sparsechunk=");
+    mCacheIdExtension.AppendInt(mSparseChunk->mRegionId);
+  }
+
+  uint32_t openFlags =
+      nsICacheStorage::OPEN_NORMALLY | nsICacheStorage::CHECK_MULTITHREADED;
+
+  if (mSparseChunk->IsMultiRegion()) {
+    if (NS_FAILED(StartSparseMultiRegion(aStorage))) {
+      OnSparseMetaUnresolved();
+    }
+    return;
+  }
+  nsresult rv = aStorage->AsyncOpenURI(mCacheEntryURI, mCacheIdExtension,
+                                       openFlags, this);
+  if (NS_FAILED(rv)) {
+    OnSparseMetaUnresolved();
+  }
+}
+
+void nsHttpChannel::OnSparseMetaUnresolved() {
+  mSparseMetaResolver = nullptr;
+  LOG(
+      ("nsHttpChannel::OnSparseMetaUnresolved [this=%p] falling back to "
+       "network + write-through",
+       this));
+  // Drop the waiting flag and trigger the network. The
+  // mSparseWantWriteThroughSingleRange flag is already set by
+  // StartSparseMetaResolve's caller (TrySetupSparseChunk's suffix branch),
+  // so the response will still be captured + written through.
+  StoreWaitForCacheEntry(LoadWaitForCacheEntry() & ~WAIT_FOR_CACHE_ENTRY);
+  (void)TriggerNetwork();
+}
+
+void nsHttpChannel::MaybeWriteSparseMetaNotSparse(nsICacheStorage* aStorage) {
+  if (!StaticPrefs::network_http_sparse_entries_enabled() || !aStorage ||
+      !mCacheEntryURI) {
+    return;
+  }
+  SparseMeta::Record record;
+  record.mNotSparse = true;
+  nsAutoCString ext;
+  AppendBaseCacheIdExtension(ext);
+  SparseMeta::AppendMetaExtension(ext);
+  LOG(
+      ("nsHttpChannel::MaybeWriteSparseMetaNotSparse [this=%p] marking URL "
+       "not-sparse-cacheable",
+       this));
+  RefPtr<SparseMetaWriter> writer =
+      new SparseMetaWriter(aStorage, mCacheEntryURI, ext, std::move(record));
+  (void)writer->Start();
+}
+
 nsresult nsHttpChannel::OpenCacheEntry(bool isHttps) {
   // Drop this flag here
   StoreConcurrentCacheAccess(0);
@@ -4933,10 +6124,48 @@ nsresult nsHttpChannel::OpenCacheEntryInternal(bool isHttps) {
     return NS_OK;
   }
 
-  // Don't cache byte range requests which are subranges, only cache 0-
-  // byte range requests.
+  // Byte-range requests for a subrange are historically not cached. With
+  // sparse entries enabled we may cache the single region the request falls in
+  // (TrySetupSparseChunk records mSparseChunk and the entry is keyed per
+  // region below); otherwise keep the historical behavior of bypassing cache.
+  //
+  // Honor BYPASS_LOCAL_CACHE (DevTools "Disable cache" and LOAD_BYPASS_CACHE)
+  // here: the rest of OpenCacheEntryInternal opens an OPEN_TRUNCATE entry for
+  // normal requests in that case, but the sparse serve coordinators below
+  // (multi-region / multi-range) probe regions read-only and so would still
+  // serve from cache. Bail out early so the request goes to network.
   if (IsSubRangeRequest(mRequestHead)) {
-    return NS_OK;
+    if (!StaticPrefs::network_http_sparse_entries_enabled() ||
+        BYPASS_LOCAL_CACHE(mLoadFlags, LoadPreferCacheLoadOverBypass())) {
+      return NS_OK;
+    }
+    if (!TrySetupSparseChunk()) {
+      // Bounded ranges that didn't parse → bypass; suffix / open-ended ranges
+      // got mSparseWantWriteThroughSingleRange + mCacheEntryURI populated, and
+      // can be served from cache when a prior fetch populated the per-URL
+      // :sparsemeta entry. Kick off an async meta resolve before falling
+      // through to network.
+      if (mSparseWantWriteThroughSingleRange && mCacheEntryURI) {
+        nsAutoCString rangeHeader;
+        if (NS_SUCCEEDED(mRequestHead.GetHeader(nsHttp::Range, rangeHeader))) {
+          SparseMetaResolveKind kind = SparseMetaResolveKind::Suffix;
+          int64_t param = 0;
+          if (ParseSingleSuffixOrOpenEndedByteRange(rangeHeader, &kind,
+                                                    &param)) {
+            nsCOMPtr<nsICacheStorage> storage;
+            if (NS_SUCCEEDED(
+                    ResolveSparseCacheStorage(getter_AddRefs(storage))) &&
+                storage &&
+                NS_SUCCEEDED(StartSparseMetaResolve(kind, param, storage))) {
+              AutoCacheWaitFlags metaWait(this);
+              metaWait.Keep(WAIT_FOR_CACHE_ENTRY);
+              return NS_OK;
+            }
+          }
+        }
+      }
+      return NS_OK;
+    }
   }
 
   // Handle correctly WaitForCacheEntry
@@ -5020,28 +6249,13 @@ nsresult nsHttpChannel::OpenCacheEntryInternal(bool isHttps) {
     cacheEntryOpenFlags |= nsICacheStorage::OPEN_BYPASS_IF_BUSY;
   }
 
-  if (mPostID) {
-    mCacheIdExtension.AppendInt(mPostID);
-  }
-  if (LoadIsTRRServiceChannel()) {
-    mCacheIdExtension.Append("TRR");
-  }
-  if (mRequestHead.IsHead()) {
-    mCacheIdExtension.Append("HEAD");
-  }
-  bool isThirdParty = false;
-  if (StaticPrefs::network_fetch_cache_partition_cross_origin() &&
-      (NS_FAILED(mLoadInfo->TriggeringPrincipal()->IsThirdPartyChannel(
-           this, &isThirdParty)) ||
-       isThirdParty) &&
-      (mLoadInfo->InternalContentPolicyType() == nsIContentPolicy::TYPE_FETCH ||
-       mLoadInfo->InternalContentPolicyType() ==
-           nsIContentPolicy::TYPE_XMLHTTPREQUEST ||
-       mLoadInfo->InternalContentPolicyType() ==
-           nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC ||
-       mLoadInfo->InternalContentPolicyType() ==
-           nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC)) {
-    mCacheIdExtension.Append("FETCH");
+  AppendBaseCacheIdExtension(mCacheIdExtension);
+  if (mSparseChunk && !mSparseChunk->IsMultiRegion()) {
+    // Cache each region of the resource under its own entry so regions are
+    // fetched, stored and evicted independently. (A multi-region request keys
+    // per region inside the serve coordinator below.)
+    mCacheIdExtension.Append(":sparsechunk=");
+    mCacheIdExtension.AppendInt(mSparseChunk->mRegionId);
   }
 
   mCacheOpenWithPriority = cacheEntryOpenFlags & nsICacheStorage::OPEN_PRIORITY;
@@ -5049,6 +6263,27 @@ nsresult nsHttpChannel::OpenCacheEntryInternal(bool isHttps) {
       CacheStorageService::CacheQueueSize(mCacheOpenWithPriority);
 
   MOZ_ASSERT(NS_IsMainThread(), "Should be called on the main thread");
+
+  if (mSparseChunk && mSparseChunk->IsMultiRegion()) {
+    // A request spanning regions is served from cache only if every region is
+    // fully present; the coordinator probes them and either serves (multiplex)
+    // or falls back to a full network fetch.
+    rv = StartSparseMultiRegion(cacheStorage);
+    NS_ENSURE_SUCCESS(rv, rv);
+    waitFlags.Keep(WAIT_FOR_CACHE_ENTRY);
+    return NS_OK;
+  }
+
+  if (!mSparseMultiRangeParts.IsEmpty()) {
+    // Multi-range (bytes=a-b,c-d,...): served from cache only when every
+    // sub-range is fully present (synthesizing a multipart/byteranges
+    // response); otherwise the request is fetched from the network.
+    rv = StartSparseMultiRange(cacheStorage);
+    NS_ENSURE_SUCCESS(rv, rv);
+    waitFlags.Keep(WAIT_FOR_CACHE_ENTRY);
+    return NS_OK;
+  }
+
   rv = cacheStorage->AsyncOpenURI(mCacheEntryURI, mCacheIdExtension,
                                   cacheEntryOpenFlags, this);
   NS_ENSURE_SUCCESS(rv, rv);
@@ -5137,6 +6372,13 @@ nsHttpChannel::OnCacheEntryCheck(nsICacheEntry* entry, uint32_t* aResult) {
   rv = nsHttp::GetHttpResponseHeadFromCacheEntry(entry,
                                                  mCachedResponseHead.get());
   NS_ENSURE_SUCCESS(rv, rv);
+
+  // Sparse byte-range entries are checked separately: the normal partial /
+  // validation logic below assumes a contiguous-from-0 entity and would
+  // misinterpret a per-region sparse entry.
+  if (mSparseChunk) {
+    return OnCacheEntryCheckSparse(entry, aResult);
+  }
 
   // Purge stale cache entries that have dcb/dcz Content-Encoding in their
   // metadata. These were written by early compression dictionary code that
@@ -5925,6 +7167,15 @@ nsresult nsHttpChannel::ReadFromCache(void) {
 void nsHttpChannel::CloseCacheEntry(bool doomOnFailure) {
   mCacheInputStream.CloseAndRelease();
 
+  // Drain our SparseWriteQueue slot (if any) here so it covers every channel
+  // termination path. The tee that wrote to the cache output stream has
+  // already released the CacheFile by this point, and the next queued sparse
+  // writer can proceed.
+  if (!mSparseWriteQueueKey.IsEmpty()) {
+    SparseWriteQueue::Release(mSparseWriteQueueKey);
+    mSparseWriteQueueKey.Truncate();
+  }
+
   if (!mCacheEntry) return;
 
   LOG(("nsHttpChannel::CloseCacheEntry [this=%p] mStatus=%" PRIx32
@@ -6017,6 +7268,17 @@ nsresult nsHttpChannel::InitCacheEntry() {
        mCacheEntry.get()));
 
   bool recreate = !LoadCacheEntryIsWriteOnly();
+
+  // For a sparse region entry we accumulate sub-ranges: when appending to a
+  // still-fresh region (and the response is a 206 for that region), keep the
+  // existing entry instead of recreating/truncating it, so previously cached
+  // sub-ranges survive. A non-206 (e.g. the server ignored Range) is handled
+  // earlier and won't reach here as an append.
+  if (mSparseChunk && mSparseChunkAppend && mResponseHead &&
+      mResponseHead->Status() == 206) {
+    recreate = false;
+  }
+
   bool dontPersist = mLoadFlags & INHIBIT_PERSISTENT_CACHING;
 
   if (!recreate && dontPersist) {
@@ -6206,6 +7468,27 @@ nsresult nsHttpChannel::UpdateCacheEntryHeaders(nsICacheEntry* entry,
   rv = entry->SetMetaDataElement("original-response-headers", head.get());
   if (NS_FAILED(rv)) return rv;
 
+  // Stamp the URL-level strong validator on this sparse region entry so
+  // SparseRegionReader can compare validators across regions cheaply without
+  // parsing each region's full stored head. Also write the matching
+  // ":sparsemeta" entry so suffix / open-ended requests can resolve the
+  // entity total at request time on a warm cache.
+  if (mSparseChunk) {
+    nsAutoCString validator;
+    SparseMeta::ValidatorKind kind = SparseMeta::ValidatorKind::None;
+    if (SparseMeta::ExtractValidator(mResponseHead.get(), validator, kind)) {
+      (void)SparseMeta::StampRegion(entry, validator, kind);
+    }
+    int64_t total = mResponseHead->TotalEntitySize();
+    if (total > 0) {
+      nsCOMPtr<nsICacheStorage> storage;
+      if (NS_SUCCEEDED(ResolveSparseCacheStorage(getter_AddRefs(storage))) &&
+          storage) {
+        MaybeWriteSparseMeta(storage, mResponseHead.get(), total);
+      }
+    }
+  }
+
   // Indicate we have successfully finished setting metadata on the cache
   // entry.
   return entry->MetaDataReady();
@@ -6350,7 +7633,10 @@ nsresult nsHttpChannel::DoInstallCacheListener(bool aSaveDecompressed,
   LOG(("Preparing to write data into the cache [uri=%s]\n", mSpec.get()));
 
   MOZ_ASSERT(mCacheEntry);
-  MOZ_ASSERT(LoadCacheEntryIsWriteOnly() || LoadCachedContentIsPartial());
+  // mSparseChunk: appending a sub-range to an existing (non-write-only) region
+  // entry is also a valid writing state.
+  MOZ_ASSERT(LoadCacheEntryIsWriteOnly() || LoadCachedContentIsPartial() ||
+             mSparseChunk);
   MOZ_ASSERT(mListener);
 
   LOG(("Trading cache input stream for output stream [channel=%p]", this));
@@ -6364,11 +7650,75 @@ nsresult nsHttpChannel::DoInstallCacheListener(bool aSaveDecompressed,
   if (predictedSize != -1) {
     predictedSize -= offset;
   }
+  if (mSparseChunk) {
+    // A sparse region entry holds only this region's slice (<= chunk size), not
+    // the whole entity. Predicting the entity size here would trip the
+    // per-entry size limit for any resource larger than that limit (so every
+    // region of a large file would be doomed). Predict just the bytes written
+    // to this region.
+    predictedSize = mSparseChunk->mReqEnd - mSparseChunk->mReqStart;
+
+    // Take the per-region write slot in the SparseWriteQueue so other sparse
+    // writers (multi-range captures, parallel single-region channels) can see
+    // we're about to hold the CacheFile output stream. If the slot is busy,
+    // skip the normal cache-listener path and route this response through the
+    // capture-listener fallback below — its downstream
+    // SparseMultiRangePartWriter will TryAcquire properly and wait its turn.
+    nsAutoCString sparseKey;
+    AppendBaseCacheIdExtension(sparseKey);
+    sparseKey.AppendLiteral(":sparsechunk=");
+    sparseKey.AppendInt(mSparseChunk->mRegionId);
+    if (SparseWriteQueue::TryAcquireOrSkip(sparseKey)) {
+      mSparseWriteQueueKey = sparseKey;
+    } else if (mResponseHead && mResponseHead->Status() == 206 && mListener) {
+      LOG(("  sparse region %" PRId64 " write slot held; routing this 206 to "
+           "capture + write-through [channel=%p]",
+           mSparseChunk->mRegionId, this));
+      mSparseWantWriteThroughSingleRange = true;
+      mCacheEntryURI = mURI;
+      RefPtr<SparseSingleRangeCaptureListener> capture =
+          new SparseSingleRangeCaptureListener(this, mListener);
+      mListener = capture;
+      return NS_OK;
+    }
+  }
 
   nsCOMPtr<nsIOutputStream> out;
   rv =
       mCacheEntry->OpenOutputStream(offset, predictedSize, getter_AddRefs(out));
   if (rv == NS_ERROR_NOT_AVAILABLE) {
+    // For a sparse 206 store, NS_ERROR_NOT_AVAILABLE almost always means
+    // another channel already holds this region entry's output stream
+    // (CacheFile permits at most one writer at a time, see
+    // CacheFile::OpenOutputStream's mOutput check). Parallel byte-range
+    // requests against the same large file routinely trigger this. Install
+    // the same capture path the suffix / multi-region-miss flows use; the
+    // body will be buffered and written back through SparseMultiRangePartWriter
+    // whose AsyncOpenURI naturally serializes after the in-flight writer
+    // releases the entry. Without this fall-through the bytes would never
+    // land in the cache and a subsequent visit refetches the same range.
+    if (mSparseChunk && mResponseHead && mResponseHead->Status() == 206 &&
+        mListener) {
+      LOG(
+          ("  sparse region entry busy with another writer; routing to "
+           "capture + write-through [channel=%p region=%" PRId64 "]",
+           this, mSparseChunk->mRegionId));
+      // Release our write queue slot before routing to capture: the capture
+      // listener's downstream SparseMultiRangePartWriter will TryAcquire its
+      // own slot. Without this, CloseCacheEntry would spuriously Release a
+      // slot that is no longer logically ours, potentially unblocking a stale
+      // waiter with no holder.
+      if (!mSparseWriteQueueKey.IsEmpty()) {
+        SparseWriteQueue::Release(mSparseWriteQueueKey);
+        mSparseWriteQueueKey.Truncate();
+      }
+      mSparseWantWriteThroughSingleRange = true;
+      mCacheEntryURI = mURI;
+      RefPtr<SparseSingleRangeCaptureListener> capture =
+          new SparseSingleRangeCaptureListener(this, mListener);
+      mListener = capture;
+      return NS_OK;
+    }
     LOG(("  entry doomed, not writing it [channel=%p]", this));
     // Entry is already doomed.
     // This may happen when expiration time is set to past and the entry

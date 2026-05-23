@@ -20,6 +20,7 @@ namespace mozilla::net::CacheFileUtils {
 // When the format changes we need to update the version.
 static uint32_t const kAltDataVersion = 1;
 const char* kAltDataKey = "alt-data";
+const char* kSparseRangesKey = "sparse-ranges";
 
 namespace {
 
@@ -349,6 +350,151 @@ size_t ValidityMap::SizeOfExcludingThis(
 
 ValidityPair& ValidityMap::operator[](uint32_t aIdx) {
   return mMap.ElementAt(aIdx);
+}
+
+void SparseRangeMap::AddRange(int64_t aOffset, int64_t aLen) {
+  if (aLen <= 0) {
+    return;
+  }
+
+  int64_t newEnd = aOffset + aLen;
+
+  // Find the first range that ends at or after the new range's start; it and
+  // any following ranges that touch/overlap get absorbed.
+  uint32_t pos = 0;
+  while (pos < mRanges.Length() && mRanges[pos].End() < aOffset) {
+    ++pos;
+  }
+
+  if (pos == mRanges.Length() || mRanges[pos].mOffset > newEnd) {
+    mRanges.InsertElementAt(pos, Range{aOffset, aLen});
+    return;
+  }
+
+  int64_t mergedOffset = std::min(mRanges[pos].mOffset, aOffset);
+  int64_t mergedEnd = std::max(mRanges[pos].End(), newEnd);
+  uint32_t last = pos;
+  while (last + 1 < mRanges.Length() &&
+         mRanges[last + 1].mOffset <= mergedEnd) {
+    mergedEnd = std::max(mergedEnd, mRanges[last + 1].End());
+    ++last;
+  }
+
+  mRanges[pos].mOffset = mergedOffset;
+  mRanges[pos].mLen = mergedEnd - mergedOffset;
+  if (last > pos) {
+    mRanges.RemoveElementsAt(pos + 1, last - pos);
+  }
+}
+
+bool SparseRangeMap::Covers(int64_t aOffset, int64_t aLen) const {
+  if (aLen <= 0) {
+    return true;
+  }
+  int64_t end = aOffset + aLen;
+  for (const auto& range : mRanges) {
+    if (range.mOffset > aOffset) {
+      return false;
+    }
+    if (range.End() >= end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SparseRangeMap::FirstAvailableRange(int64_t aOffset, int64_t* aStart,
+                                         int64_t* aLength) const {
+  for (const auto& range : mRanges) {
+    if (range.End() <= aOffset) {
+      continue;
+    }
+    // This range is the first that extends past aOffset.
+    *aStart = std::max(aOffset, range.mOffset);
+    *aLength = range.End() - *aStart;
+    return true;
+  }
+  return false;
+}
+
+int64_t SparseRangeMap::FirstHoleAfter(int64_t aOffset) const {
+  for (const auto& range : mRanges) {
+    if (aOffset < range.mOffset) {
+      return aOffset;
+    }
+    if (aOffset < range.End()) {
+      return range.End();
+    }
+  }
+  return aOffset;
+}
+
+int64_t SparseRangeMap::ValidBytes() const {
+  int64_t sum = 0;
+  for (const auto& range : mRanges) {
+    sum += range.mLen;
+  }
+  return sum;
+}
+
+bool SparseRangeMap::IsContiguousFromZero(int64_t aDataSize) const {
+  if (mRanges.IsEmpty()) {
+    return aDataSize == 0;
+  }
+  return mRanges.Length() == 1 && mRanges[0].mOffset == 0 &&
+         mRanges[0].mLen == aDataSize;
+}
+
+void SparseRangeMap::Truncate(int64_t aOffset) {
+  if (aOffset <= 0) {
+    mRanges.Clear();
+    return;
+  }
+  for (uint32_t i = mRanges.Length(); i > 0;) {
+    --i;
+    if (mRanges[i].mOffset >= aOffset) {
+      mRanges.RemoveElementAt(i);
+    } else if (mRanges[i].End() > aOffset) {
+      mRanges[i].mLen = aOffset - mRanges[i].mOffset;
+    }
+  }
+}
+
+void SparseRangeMap::Serialize(nsACString& aOutput) const {
+  aOutput.Truncate();
+  for (const auto& range : mRanges) {
+    aOutput.AppendInt(range.mOffset);
+    aOutput.Append(',');
+    aOutput.AppendInt(range.mLen);
+    aOutput.Append(';');
+  }
+}
+
+void SparseRangeMap::Parse(const nsACString& aInput) {
+  mRanges.Clear();
+  Tokenizer t(aInput);
+  while (!t.CheckEOF()) {
+    int64_t offset = 0;
+    int64_t len = 0;
+    if (!t.ReadSignedInteger(&offset) || !t.CheckChar(',') ||
+        !t.ReadSignedInteger(&len) || !t.CheckChar(';') || offset < 0 ||
+        len <= 0) {
+      break;
+    }
+    AddRange(offset, len);
+  }
+}
+
+void SparseRangeMap::Log() const {
+  LOG(("SparseRangeMap::Log() - number of ranges: %zu", mRanges.Length()));
+  for (const auto& range : mRanges) {
+    LOG(("    [%" PRId64 ", %" PRId64 ")", range.mOffset, range.End()));
+  }
+}
+
+size_t SparseRangeMap::SizeOfExcludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  return mRanges.ShallowSizeOfExcludingThis(mallocSizeOf);
 }
 
 StaticMutex DetailedCacheHitTelemetry::sLock;
